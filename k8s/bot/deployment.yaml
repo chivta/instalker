@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: instalker
+  namespace: instalker
+  labels:
+    app: instalker
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  # The SQLite file lives on a ReadWriteOnce volume, so the old pod must be gone
+  # before the new one starts. A rolling update would deadlock on the mount.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: instalker
+  template:
+    metadata:
+      labels:
+        app: instalker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: instalker
+          image: ghcr.io/chivta/instalker:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: DB_PATH
+              value: /app/data/instalker.db
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: instalker-data
+        - name: tmp
+          emptyDir: {}
+      imagePullSecrets:
+        - name: ghcr-secret
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: instalker-svc
+  namespace: instalker
+  labels:
+    app: instalker
+spec:
+  selector:
+    app: instalker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP

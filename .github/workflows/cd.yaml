@@ -1,0 +1,77 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MANIFEST: k8s/bot/deployment.yaml
+
+jobs:
+  build-push:
+    # Only deploy commits that passed CI.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      # Checked out on the branch, not the detached commit, so the manifest
+      # commit at the end has somewhere to land.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Ensure main still points at the tested commit
+        run: |
+          if [ "$(git rev-parse HEAD)" != "${{ github.event.workflow_run.head_sha }}" ]; then
+            echo "main has moved past the tested commit, a newer CD run will deploy it"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.event.workflow_run.head_sha }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The manifest in git is the ground truth for what runs in the cluster.
+      - name: Pin image tag in manifest
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${{ github.event.workflow_run.head_sha }}"
+          sed -i -E "s|image: ${REGISTRY}/${IMAGE_NAME}:.*|image: ${IMAGE}|" "${MANIFEST}"
+          git diff --quiet "${MANIFEST}" && echo "manifest already current" && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${MANIFEST}"
+          git commit -m "deploy: instalker ${{ github.event.workflow_run.head_sha }}"
+          git push
