@@ -43,7 +43,7 @@ func New(sessionID string) (*Client, error) {
 		// Redirects must be followed: the first authenticated call is bounced
 		// back to itself so Instagram can issue the csrftoken, ds_user_id and
 		// mid cookies that accompany the session.
-		http: &http.Client{Jar: jar, Timeout: requestTimeout},
+		http:      &http.Client{Jar: jar, Timeout: requestTimeout},
 		sessionID: sessionID,
 	}
 
