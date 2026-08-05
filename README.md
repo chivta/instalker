@@ -45,16 +45,33 @@ docker build --target production -t instalker .
 ## Deploying
 
 Manifests live in `k8s/` and are the ground truth for what runs in the cluster.
+Flux reconciles them — nothing is applied by hand. The cluster side is registered
+in the `homelab` repo under `clusters/main/apps/instalker/`.
+
+### Secrets
+
+The bot's credentials live in `k8s/secrets.yaml`, which is **gitignored**, and are
+committed only in SOPS-encrypted form as `k8s/secrets.enc.yaml`. Encryption uses
+the same age recipient as `ruscan`, so Flux decrypts it in-cluster with the
+existing `ruscan-sops-age` secret referenced by the Kustomization.
+
+To change a credential:
 
 ```sh
-cp .env.secrets.example .env.secrets   # fill it in
-./create-secrets.sh                    # creates the namespace, ghcr-secret, app-secrets
-kubectl apply -k k8s/
+sops -d k8s/secrets.enc.yaml > k8s/secrets.yaml   # needs the age private key
+$EDITOR k8s/secrets.yaml
+sops -e k8s/secrets.yaml > k8s/secrets.enc.yaml
 ```
 
-`create-secrets.sh` reads `.env.secrets` (gitignored) and applies two secrets:
-`ghcr-secret` for pulling the image and `app-secrets` for the bot's configuration,
-which the Deployment consumes wholesale via `envFrom`.
+`IG_SESSIONID` is the value that expires and needs periodic rotation this way.
+
+The registry pull secret is the one thing SOPS does not cover, since it is a
+cluster-level docker config rather than app config:
+
+```sh
+cp .env.secrets.example .env.secrets   # GHCR credentials only
+./create-secrets.sh                    # creates the namespace and ghcr-secret
+```
 
 The SQLite file sits on a 1Gi `ReadWriteOnce` PVC mounted at `/app/data`. Because
 that volume cannot be attached twice, the Deployment uses the `Recreate` strategy

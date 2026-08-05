@@ -4,3 +4,4 @@ data/
 /instalker.log
 .tmp/
 .env.secrets
+secrets.yaml

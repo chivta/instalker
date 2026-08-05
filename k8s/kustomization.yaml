@@ -4,5 +4,10 @@ kind: Kustomization
 namespace: instalker
 
 resources:
+  - namespace.yaml
+  # Encrypted with the shared ruscan age key; Flux decrypts it in-cluster with
+  # the `ruscan-sops-age` secret. Edit k8s/secrets.yaml (gitignored) and re-run
+  # `sops -e k8s/secrets.yaml > k8s/secrets.enc.yaml` to change a value.
+  - secrets.enc.yaml
   - bot/pvc.yaml
   - bot/deployment.yaml
