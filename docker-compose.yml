@@ -1,0 +1,17 @@
+# Local development only. Never used for staging or production.
+services:
+  instalker:
+    build:
+      context: .
+      target: dev
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/instalker.db
+    volumes:
+      - .:/app
+      - instalker-data:/app/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  instalker-data:
