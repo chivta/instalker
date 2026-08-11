@@ -2,10 +2,12 @@ package notifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	tele "gopkg.in/telebot.v4"
 
 	"github.com/arvlas/instalker/internal/domain"
@@ -16,9 +18,11 @@ const (
 	telegramCaptionLimit = 1024
 	// albumLimit is the maximum number of items Telegram accepts in one album.
 	albumLimit = 10
-	// pollerTimeout keeps telebot from starting its own long-polling loop; the
-	// bot only sends.
+	// pollerTimeout is how long each getUpdates call waits for a command.
 	pollerTimeout = 10 * time.Second
+	// probeTimeout bounds a /ping check so a throttled Instagram cannot leave
+	// the command hanging indefinitely.
+	probeTimeout = 60 * time.Second
 )
 
 // Telegram delivers media to a single chat.
@@ -89,6 +93,93 @@ func (t *Telegram) Send(ctx context.Context, media domain.Media) error {
 	}
 
 	return nil
+}
+
+// HandlePing wires /ping to a live scrape check. Commands from any other chat
+// are ignored: the bot's username is public, so anyone can message it.
+func (t *Telegram) HandlePing(ctx context.Context, probe func(context.Context) domain.Probe) {
+	t.bot.Handle("/ping", func(c tele.Context) error {
+		if c.Chat().ID != t.chat.ID {
+			log.Warn().Int64("chat_id", c.Chat().ID).Msg("ignoring command from an unknown chat")
+			return nil
+		}
+
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+
+		result := probe(probeCtx)
+		log.Info().Bool("ok", result.OK()).Dur("elapsed", result.Elapsed).Msg("ping probe finished")
+
+		return c.Send(formatProbe(result), tele.ModeHTML, tele.NoPreview)
+	})
+}
+
+// Run consumes Telegram updates until ctx is cancelled. Sending works without
+// it; only commands need this loop.
+func (t *Telegram) Run(ctx context.Context) error {
+	err := t.bot.SetCommands([]tele.Command{
+		{Text: "ping", Description: "check that Instagram scraping works"},
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to publish bot commands")
+	}
+
+	go func() {
+		<-ctx.Done()
+		t.bot.Stop()
+	}()
+
+	log.Info().Msg("telegram command listener started")
+	t.bot.Start()
+	log.Info().Msg("telegram command listener stopped")
+
+	return nil
+}
+
+func formatProbe(probe domain.Probe) string {
+	var b strings.Builder
+
+	header := "🏓 <b>Instagram scraping is working</b>"
+	if !probe.OK() {
+		header = "🔴 <b>Instagram scraping is failing</b>"
+	}
+	fmt.Fprintf(&b, "%s\n<i>checked in %s</i>\n", header, probe.Elapsed.Round(time.Millisecond))
+
+	if len(probe.Targets) == 0 {
+		b.WriteString("\nNo targets are being watched.")
+		return b.String()
+	}
+
+	for _, target := range probe.Targets {
+		if !target.OK() {
+			fmt.Fprintf(&b, "\n🔴 <b>%s</b> — %s", escape(target.User.Username), escape(describeErr(target.Err)))
+			continue
+		}
+
+		fmt.Fprintf(&b, "\n✅ <b>%s</b> — %d posts, %d stories", escape(target.User.Username), target.Posts, target.Stories)
+		if !target.Latest.IsZero() {
+			fmt.Fprintf(&b, ", latest %s ago", time.Since(target.Latest).Round(time.Minute))
+		}
+	}
+
+	return b.String()
+}
+
+// describeErr turns a scrape failure into something actionable, since the raw
+// error is mostly Instagram's own noise.
+func describeErr(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrRateLimited):
+		return "rate limited by Instagram (this host is being throttled)"
+	case errors.Is(err, domain.ErrCheckpointRequired):
+		return "Instagram wants a login challenge cleared"
+	case errors.Is(err, domain.ErrUnauthorized):
+		return "session rejected, IG_SESSIONID needs replacing"
+	case errors.Is(err, domain.ErrNotFound):
+		return "account not found"
+	default:
+		return err.Error()
+	}
 }
 
 // Notify sends a plain service message, used for startup and error reporting.

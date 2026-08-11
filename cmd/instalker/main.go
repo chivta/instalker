@@ -106,6 +106,18 @@ func run(cfg config.Config) error {
 	repo := storage.NewMediaRepo(db)
 	watcher := poller.New(insta, repo, telegram, targets, cfg.PollInterval)
 
+	// Commands are served alongside polling; /ping reports whether scraping
+	// works right now instead of waiting for the next tick to show up in logs.
+	telegram.HandlePing(ctx, watcher.Probe)
+	commandErr := make(chan error, 1)
+	go func() {
+		commandErr <- telegram.Run(ctx)
+	}()
+	defer func() {
+		stop()
+		<-commandErr
+	}()
+
 	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> every %s", strings.Join(usernames(targets), "</b>, <b>"), cfg.PollInterval))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to send startup notice")

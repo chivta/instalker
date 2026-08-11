@@ -228,3 +228,51 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-timer.C:
 	}
 }
+
+// Probe scrapes every target once and reports what came back, without
+// delivering anything or touching the seen-state. It answers the question the
+// logs otherwise only answer on the next tick: is scraping working right now.
+func (p *Poller) Probe(ctx context.Context) domain.Probe {
+	start := time.Now()
+	probe := domain.Probe{Targets: make([]domain.TargetProbe, 0, len(p.targets))}
+
+	for _, target := range p.targets {
+		result := domain.TargetProbe{User: target}
+
+		posts, err := p.insta.Posts(ctx, target)
+		if err != nil {
+			result.Err = err
+		} else {
+			result.Posts = len(posts)
+			result.Latest = newest(posts)
+		}
+
+		stories, err := p.insta.Stories(ctx, target)
+		switch {
+		case err != nil && result.Err == nil:
+			result.Err = err
+		case err == nil:
+			result.Stories = len(stories)
+			if storyLatest := newest(stories); storyLatest.After(result.Latest) {
+				result.Latest = storyLatest
+			}
+		}
+
+		probe.Targets = append(probe.Targets, result)
+	}
+
+	probe.Elapsed = time.Since(start)
+
+	return probe
+}
+
+func newest(media []domain.Media) time.Time {
+	var latest time.Time
+	for _, m := range media {
+		if m.TakenAt.After(latest) {
+			latest = m.TakenAt
+		}
+	}
+
+	return latest
+}

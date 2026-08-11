@@ -284,3 +284,58 @@ func TestResolveTargetsPreservesCause(t *testing.T) {
 		t.Errorf("cause lost ErrRateLimited, retry logic would treat it as fatal: %v", err)
 	}
 }
+
+func TestProbe(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	older := domain.Media{ID: "p1", Kind: domain.KindPost, Owner: owner, TakenAt: time.Unix(1700000000, 0)}
+	newer := domain.Media{ID: "s1", Kind: domain.KindStory, Owner: owner, TakenAt: time.Unix(1700009999, 0)}
+
+	t.Run("reports counts and newest timestamp across both feeds", func(t *testing.T) {
+		insta := &fakeInsta{posts: []domain.Media{older}, stories: []domain.Media{newer}}
+		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+
+		got := p.Probe(context.Background())
+
+		if !got.OK() {
+			t.Fatalf("probe not ok: %v", got.Targets[0].Err)
+		}
+		if got.Targets[0].Posts != 1 || got.Targets[0].Stories != 1 {
+			t.Errorf("counts = %d posts / %d stories, want 1/1", got.Targets[0].Posts, got.Targets[0].Stories)
+		}
+		if !got.Targets[0].Latest.Equal(newer.TakenAt) {
+			t.Errorf("latest = %v, want the story timestamp %v", got.Targets[0].Latest, newer.TakenAt)
+		}
+	})
+
+	t.Run("surfaces a feed failure", func(t *testing.T) {
+		insta := &fakeInsta{postsErr: fmt.Errorf("posts: %w", domain.ErrRateLimited)}
+		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+
+		got := p.Probe(context.Background())
+
+		if got.OK() {
+			t.Fatal("probe reported ok despite a failing feed")
+		}
+		if !errors.Is(got.Targets[0].Err, domain.ErrRateLimited) {
+			t.Errorf("err = %v, want rate limited", got.Targets[0].Err)
+		}
+	})
+
+	t.Run("does not deliver or mark anything seen", func(t *testing.T) {
+		insta := &fakeInsta{posts: []domain.Media{older}, stories: []domain.Media{newer}}
+		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+		sender := &fakeSender{}
+		p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+
+		p.Probe(context.Background())
+
+		if len(sender.sent) != 0 {
+			t.Errorf("probe delivered %d media, want 0", len(sender.sent))
+		}
+		if len(repo.seen) != 0 {
+			t.Errorf("probe marked %d media seen, want 0", len(repo.seen))
+		}
+	})
+}

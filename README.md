@@ -27,6 +27,28 @@ The first cycle for a target only records a baseline — existing posts and live
 stories are marked as seen without being sent, so starting the bot does not dump
 history into the chat. Everything after that is forwarded.
 
+## Commands
+
+`/ping` scrapes every watched account once and reports what came back, so you can
+tell whether scraping works right now instead of waiting for the next tick to
+show up in the logs:
+
+```
+🏓 Instagram scraping is working
+checked in 1.2s
+
+✅ locroise — 12 posts, 2 stories, latest 2h0m0s ago
+✅ lem1rol — 11 posts, 0 stories, latest 18h0m0s ago
+```
+
+When it fails, the reason is spelled out — throttling, a rejected session, or a
+pending challenge — because those need different responses. The probe delivers
+nothing and does not touch the seen-state, so running it never causes a missed
+or duplicated notification.
+
+Commands are only accepted from `CHAT_ID`; the bot's username is public, so
+anything else is ignored.
+
 ## Configuration
 
 Copy `.example.env` to `.env` and fill it in. Every variable is documented there.
