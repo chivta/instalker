@@ -17,7 +17,10 @@ func ResolveTargets(ctx context.Context, insta instagramClient, me domain.User, 
 		for _, username := range usernames {
 			user, err := insta.Profile(ctx, username)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %v", domain.ErrTargetsUnresolved, err)
+				// Both verbs are %w: callers match on ErrTargetsUnresolved to
+				// describe the failure and on the cause to decide whether it is
+				// worth retrying.
+				return nil, fmt.Errorf("%w: %w", domain.ErrTargetsUnresolved, err)
 			}
 			targets = append(targets, user)
 		}
@@ -27,7 +30,7 @@ func ResolveTargets(ctx context.Context, insta instagramClient, me domain.User, 
 
 	following, err := insta.Following(ctx, me.PK)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrTargetsUnresolved, err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrTargetsUnresolved, err)
 	}
 	if len(following) == 0 {
 		return nil, fmt.Errorf("%w: %s follows nobody and TARGETS is empty", domain.ErrTargetsUnresolved, me.Username)

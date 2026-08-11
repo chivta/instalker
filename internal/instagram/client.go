@@ -140,6 +140,15 @@ func (c *Client) decorate(req *http.Request) {
 // wall, which is exactly the ambiguity that matters when the session works from
 // one network and not another.
 func statusError(status int, body []byte) error {
+	// Instagram reports throttling as "please wait a few minutes", attached to
+	// a 401 with require_login set. Taken at face value that reads as a dead
+	// session and provokes a password login, which earns a challenge and makes
+	// things worse. The message is the only reliable signal, so it wins over
+	// the status code.
+	if strings.Contains(string(body), "wait a few minutes") {
+		return fmt.Errorf("%w: status %d: %s", domain.ErrRateLimited, status, truncate(string(body), 200))
+	}
+
 	switch {
 	case status == http.StatusOK:
 		if strings.Contains(string(body), "checkpoint_required") {

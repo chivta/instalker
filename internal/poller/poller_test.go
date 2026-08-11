@@ -2,6 +2,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,10 +12,11 @@ import (
 )
 
 type fakeInsta struct {
-	posts      []domain.Media
-	stories    []domain.Media
-	postsErr   error
-	storiesErr error
+	posts        []domain.Media
+	stories      []domain.Media
+	postsErr     error
+	storiesErr   error
+	followingErr error
 }
 
 func (f *fakeInsta) Profile(context.Context, string) (domain.User, error) {
@@ -22,7 +24,7 @@ func (f *fakeInsta) Profile(context.Context, string) (domain.User, error) {
 }
 
 func (f *fakeInsta) Following(context.Context, string) ([]domain.User, error) {
-	return nil, nil
+	return nil, f.followingErr
 }
 
 func (f *fakeInsta) Posts(context.Context, domain.User) ([]domain.Media, error) {
@@ -263,5 +265,22 @@ func TestRateLimitAlertDoesNotAskForNewSession(t *testing.T) {
 	// Rotating the cookie does not clear a 429, so the alert must not ask for one.
 	if strings.Contains(sender.notices[0], "IG_SESSIONID") {
 		t.Errorf("rate limit alert wrongly asks for a new session: %q", sender.notices[0])
+	}
+}
+
+// ResolveTargets must not hide why it failed: the caller decides whether to
+// retry based on the cause, and %v wrapping silently made everything fatal.
+func TestResolveTargetsPreservesCause(t *testing.T) {
+	failing := &fakeInsta{followingErr: fmt.Errorf("following 1: %w", domain.ErrRateLimited)}
+
+	_, err := ResolveTargets(context.Background(), failing, domain.User{PK: "1", Username: "me"}, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, domain.ErrTargetsUnresolved) {
+		t.Errorf("cause lost ErrTargetsUnresolved: %v", err)
+	}
+	if !errors.Is(err, domain.ErrRateLimited) {
+		t.Errorf("cause lost ErrRateLimited, retry logic would treat it as fatal: %v", err)
 	}
 }

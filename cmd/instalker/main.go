@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -62,6 +61,19 @@ func run(cfg config.Config) error {
 		return err
 	}
 
+	// The probe server comes up before Instagram is contacted. Authentication
+	// can retry for minutes when Instagram is throttling, and a container with
+	// nothing listening fails its liveness probe and is killed mid-retry.
+	probes := health.New(cfg.HTTPAddr, metrics.Handler())
+	probeErr := make(chan error, 1)
+	go func() {
+		probeErr <- probes.Run(ctx)
+	}()
+	defer func() {
+		stop()
+		<-probeErr
+	}()
+
 	insta, me, err := authenticate(ctx, cfg)
 	if err != nil {
 		// A rejected session is just as fatal as a challenge, and just as
@@ -73,8 +85,18 @@ func run(cfg config.Config) error {
 	}
 	log.Info().Str("username", me.Username).Str("pk", me.PK).Msg("instagram session ready")
 
-	targets, err := poller.ResolveTargets(ctx, insta, me, cfg.Targets)
+	// This is the first call that actually exercises the session, so it is the
+	// one that gets the retry budget.
+	var targets []domain.User
+	err = withBackoff(ctx, "resolve targets", func() error {
+		var resolveErr error
+		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, cfg.Targets)
+		return resolveErr
+	})
 	if err != nil {
+		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
+			notifyLoginFailure(ctx, telegram, cfg, err)
+		}
 		return err
 	}
 	for _, t := range targets {
@@ -83,37 +105,17 @@ func run(cfg config.Config) error {
 
 	repo := storage.NewMediaRepo(db)
 	watcher := poller.New(insta, repo, telegram, targets, cfg.PollInterval)
-	probes := health.New(cfg.HTTPAddr, metrics.Handler())
 
 	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> every %s", strings.Join(usernames(targets), "</b>, <b>"), cfg.PollInterval))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to send startup notice")
 	}
 
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		errs <- watcher.Run(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		errs <- probes.Run(ctx)
-	}()
-
-	wg.Wait()
-	close(errs)
-
-	var joined error
-	for err := range errs {
-		joined = errors.Join(joined, err)
-	}
+	err = watcher.Run(ctx)
 
 	log.Info().Msg("shutdown complete")
 
-	return joined
+	return err
 }
 
 // authenticate prefers a supplied session cookie and only falls back to a
@@ -124,56 +126,46 @@ func authenticate(ctx context.Context, cfg config.Config) (*instagram.Client, do
 		return nil, domain.User{}, err
 	}
 
-	if cfg.SessionID != "" {
-		me, err := verifyWithBackoff(ctx, insta)
-		if err == nil {
-			return insta, me, nil
-		}
-
-		// Only a session Instagram actively rejected is worth trading for a
-		// password login. Throttling says nothing about the session, and a
-		// password login answers it with a challenge that no amount of
-		// retrying clears — so it must not be attempted here.
-		if !errors.Is(err, domain.ErrUnauthorized) {
+	// A password login is only attempted when there is no session to use. It is
+	// never a fallback for a session that looks rejected: Instagram answers it
+	// with a challenge, which is strictly worse than retrying.
+	if cfg.SessionID == "" {
+		err = insta.Login(ctx, cfg.Username, cfg.Password)
+		if err != nil {
 			return nil, domain.User{}, err
 		}
-		log.Warn().Err(err).Msg("configured IG_SESSIONID was rejected, falling back to password login")
 	}
 
-	err = insta.Login(ctx, cfg.Username, cfg.Password)
+	me, err := insta.SessionUser()
 	if err != nil {
 		return nil, domain.User{}, err
 	}
-
-	me, err := insta.VerifySession(ctx)
-	if err != nil {
-		return nil, domain.User{}, err
-	}
+	me.Username = cfg.Username
 
 	return insta, me, nil
 }
 
-// verifyWithBackoff retries a transient verification failure. Instagram
-// throttles by source address, and a pod that exits on the first 429 is
-// restarted straight into another request, which deepens the block.
-func verifyWithBackoff(ctx context.Context, insta *instagram.Client) (domain.User, error) {
+// withBackoff retries an operation that failed for a transient reason.
+// Instagram throttles by source address, and a pod that exits on the first 429
+// is restarted straight into another request, which deepens the block.
+func withBackoff(ctx context.Context, what string, op func() error) error {
 	delay := authRetryDelay
 
 	for attempt := 1; ; attempt++ {
-		me, err := insta.VerifySession(ctx)
+		err := op()
 		if err == nil {
-			return me, nil
+			return nil
 		}
 
 		transient := errors.Is(err, domain.ErrRateLimited) || errors.Is(err, domain.ErrBadResponse)
 		if !transient || attempt == authRetryAttempts {
-			return domain.User{}, err
+			return err
 		}
 
-		log.Warn().Err(err).Int("attempt", attempt).Dur("retry_in", delay).Msg("instagram verification failed, retrying")
+		log.Warn().Err(err).Str("operation", what).Int("attempt", attempt).Dur("retry_in", delay).Msg("instagram call failed, retrying")
 
 		if !sleep(ctx, delay) {
-			return domain.User{}, ctx.Err()
+			return ctx.Err()
 		}
 		delay *= 2
 	}

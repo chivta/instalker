@@ -84,34 +84,35 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	}
 }
 
-// VerifySession checks that the current session cookie is still accepted.
-func (c *Client) VerifySession(ctx context.Context) (domain.User, error) {
+// SessionUser reports who the current session belongs to.
+//
+// The account's primary key is the first field of the session cookie itself
+// ("<pk>:<token>:..."), so this costs no request. That matters: the endpoint
+// that used to be called here answers with HTML often enough that a healthy
+// session looked rejected, and every extra call is one more against whatever
+// budget Instagram is throttling on.
+func (c *Client) SessionUser() (domain.User, error) {
 	if c.sessionID == "" {
 		return domain.User{}, domain.ErrUnauthorized
 	}
 
-	var me struct {
-		FormData struct {
-			Username  string `json:"username"`
-			FirstName string `json:"first_name"`
-		} `json:"form_data"`
-	}
-
-	err := c.get(ctx, "/api/v1/accounts/edit/web_form_data/", &me)
+	// Browsers store the cookie percent-encoded; tolerate either form.
+	decoded, err := url.QueryUnescape(c.sessionID)
 	if err != nil {
-		return domain.User{}, fmt.Errorf("verify session: %w", err)
-	}
-	if me.FormData.Username == "" {
-		return domain.User{}, domain.ErrUnauthorized
+		decoded = c.sessionID
 	}
 
-	// The edit form carries no primary key; resolve it from the public profile.
-	user, err := c.Profile(ctx, me.FormData.Username)
-	if err != nil {
-		return domain.User{}, fmt.Errorf("verify session: %w", err)
+	pk, _, found := strings.Cut(decoded, ":")
+	if !found || pk == "" {
+		return domain.User{}, fmt.Errorf("%w: session cookie has no account id", domain.ErrUnauthorized)
+	}
+	for _, r := range pk {
+		if r < '0' || r > '9' {
+			return domain.User{}, fmt.Errorf("%w: session cookie account id %q is not numeric", domain.ErrUnauthorized, pk)
+		}
 	}
 
-	return user, nil
+	return domain.User{PK: pk}, nil
 }
 
 // primeCSRF fetches the login page so the jar receives a csrftoken cookie.
