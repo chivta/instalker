@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -21,6 +22,13 @@ import (
 	"github.com/arvlas/instalker/internal/notifier"
 	"github.com/arvlas/instalker/internal/poller"
 	"github.com/arvlas/instalker/internal/storage"
+)
+
+const (
+	// authRetryAttempts and authRetryDelay bound the startup retry of a
+	// transient Instagram failure; the delay doubles between attempts.
+	authRetryAttempts = 4
+	authRetryDelay    = 30 * time.Second
 )
 
 func main() {
@@ -59,7 +67,7 @@ func run(cfg config.Config) error {
 		// A rejected session is just as fatal as a challenge, and just as
 		// invisible from the chat unless it is reported there.
 		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
-			notifyCheckpoint(ctx, telegram, cfg, err)
+			notifyLoginFailure(ctx, telegram, cfg, err)
 		}
 		return err
 	}
@@ -117,9 +125,17 @@ func authenticate(ctx context.Context, cfg config.Config) (*instagram.Client, do
 	}
 
 	if cfg.SessionID != "" {
-		me, err := insta.VerifySession(ctx)
+		me, err := verifyWithBackoff(ctx, insta)
 		if err == nil {
 			return insta, me, nil
+		}
+
+		// Only a session Instagram actively rejected is worth trading for a
+		// password login. Throttling says nothing about the session, and a
+		// password login answers it with a challenge that no amount of
+		// retrying clears — so it must not be attempted here.
+		if !errors.Is(err, domain.ErrUnauthorized) {
+			return nil, domain.User{}, err
 		}
 		log.Warn().Err(err).Msg("configured IG_SESSIONID was rejected, falling back to password login")
 	}
@@ -137,16 +153,63 @@ func authenticate(ctx context.Context, cfg config.Config) (*instagram.Client, do
 	return insta, me, nil
 }
 
-func notifyCheckpoint(ctx context.Context, telegram *notifier.Telegram, cfg config.Config, cause error) {
+// verifyWithBackoff retries a transient verification failure. Instagram
+// throttles by source address, and a pod that exits on the first 429 is
+// restarted straight into another request, which deepens the block.
+func verifyWithBackoff(ctx context.Context, insta *instagram.Client) (domain.User, error) {
+	delay := authRetryDelay
+
+	for attempt := 1; ; attempt++ {
+		me, err := insta.VerifySession(ctx)
+		if err == nil {
+			return me, nil
+		}
+
+		transient := errors.Is(err, domain.ErrRateLimited) || errors.Is(err, domain.ErrBadResponse)
+		if !transient || attempt == authRetryAttempts {
+			return domain.User{}, err
+		}
+
+		log.Warn().Err(err).Int("attempt", attempt).Dur("retry_in", delay).Msg("instagram verification failed, retrying")
+
+		if !sleep(ctx, delay) {
+			return domain.User{}, ctx.Err()
+		}
+		delay *= 2
+	}
+}
+
+// sleep waits for d, reporting false if the context was cancelled first.
+func sleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// notifyLoginFailure reports a startup failure that only a human can clear.
+// Throttling is deliberately not reported here: it is not actionable, and the
+// pod restart loop would turn it into a stream of identical messages.
+func notifyLoginFailure(ctx context.Context, telegram *notifier.Telegram, cfg config.Config, cause error) {
+	reason := "Instagram is refusing the stored session"
+	if errors.Is(cause, domain.ErrCheckpointRequired) {
+		reason = "Instagram is requiring a login challenge"
+	}
+
 	text := fmt.Sprintf(
-		"🔴 instalker cannot log in as <b>%s</b>: Instagram is requiring a login challenge.\n\n"+
-			"Log in to instagram.com in a browser, clear the challenge, then copy the <code>sessionid</code> cookie into <code>IG_SESSIONID</code> in .env and restart.\n\n<code>%s</code>",
-		cfg.Username, cause,
+		"🔴 instalker cannot log in as <b>%s</b>: %s.\n\n"+
+			"Log in to instagram.com in a browser, clear any challenge, then copy the <code>sessionid</code> cookie into <code>IG_SESSIONID</code> and restart.\n\n<code>%s</code>",
+		cfg.Username, reason, cause,
 	)
 
 	err := telegram.Notify(ctx, text)
 	if err != nil {
-		log.Error().Err(err).Msg("failed to send checkpoint notice")
+		log.Error().Err(err).Msg("failed to send login failure notice")
 	}
 }
 

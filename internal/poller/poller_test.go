@@ -241,3 +241,27 @@ func TestPartialFetchDoesNotBaseline(t *testing.T) {
 		t.Fatal("target was baselined despite a failed feed")
 	}
 }
+
+func TestRateLimitAlertDoesNotAskForNewSession(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	insta := &fakeInsta{
+		postsErr:   fmt.Errorf("posts target: %w", domain.ErrRateLimited),
+		storiesErr: fmt.Errorf("stories target: %w", domain.ErrRateLimited),
+	}
+	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+
+	p.cycle(context.Background())
+
+	if len(sender.notices) != 1 {
+		t.Fatalf("got %d notices, want 1", len(sender.notices))
+	}
+	if !strings.Contains(sender.notices[0], "rate limiting") {
+		t.Errorf("alert should name throttling, got %q", sender.notices[0])
+	}
+	// Rotating the cookie does not clear a 429, so the alert must not ask for one.
+	if strings.Contains(sender.notices[0], "IG_SESSIONID") {
+		t.Errorf("rate limit alert wrongly asks for a new session: %q", sender.notices[0])
+	}
+}

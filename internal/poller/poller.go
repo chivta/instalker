@@ -79,7 +79,7 @@ func (p *Poller) Run(ctx context.Context) error {
 }
 
 func (p *Poller) cycle(ctx context.Context) {
-	authBroken := false
+	var blocked error
 
 	for _, target := range p.targets {
 		if ctx.Err() != nil {
@@ -90,36 +90,48 @@ func (p *Poller) cycle(ctx context.Context) {
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Msg("poll cycle failed for target")
 
-			if errors.Is(err, domain.ErrUnauthorized) || errors.Is(err, domain.ErrCheckpointRequired) {
-				authBroken = true
+			if blocked == nil && isBlockedErr(err) {
+				blocked = err
 			}
 		}
 	}
 
-	p.reportAuthState(ctx, authBroken)
+	p.reportStall(ctx, blocked)
 	metrics.IncPollCycle()
 }
 
-// reportAuthState tells the chat when the Instagram session stops being
-// accepted, and again when it recovers. Without this the bot polls into the
-// void: the logs fill up but nobody is watching them.
-func (p *Poller) reportAuthState(ctx context.Context, authBroken bool) {
+// reportStall tells the chat when Instagram stops answering, and again when it
+// recovers. Without this the bot polls into the void: the logs fill up but
+// nobody is watching them.
+func (p *Poller) reportStall(ctx context.Context, blocked error) {
 	switch {
-	case authBroken && !p.authAlerted:
+	case blocked != nil && !p.authAlerted:
 		p.authAlerted = true
-		err := p.sender.Notify(ctx, "🔴 instalker: Instagram is refusing the session, so polling is stalled.\n\n"+
-			"Log in to instagram.com in a browser, copy a fresh <code>sessionid</code> cookie into the "+
-			"<code>IG_SESSIONID</code> secret and restart the bot.")
-		if err != nil {
-			log.Error().Err(err).Msg("failed to send auth alert")
+
+		text := "🔴 instalker: Instagram is refusing the session, so polling is stalled.\n\n" +
+			"Log in to instagram.com in a browser, copy a fresh <code>sessionid</code> cookie into the " +
+			"<code>IG_SESSIONID</code> secret and restart the bot."
+		if errors.Is(blocked, domain.ErrRateLimited) {
+			// Rotating the session would not help here, so do not ask for one.
+			text = "🔴 instalker: Instagram is rate limiting this host, so polling is stalled. " +
+				"It may clear on its own; if it persists the requests need to come from a different network."
 		}
-	case !authBroken && p.authAlerted:
-		p.authAlerted = false
-		err := p.sender.Notify(ctx, "🟢 instalker: Instagram session accepted again, polling resumed.")
+
+		err := p.sender.Notify(ctx, text)
 		if err != nil {
-			log.Error().Err(err).Msg("failed to send auth recovery notice")
+			log.Error().Err(err).Msg("failed to send stall alert")
+		}
+	case blocked == nil && p.authAlerted:
+		p.authAlerted = false
+		err := p.sender.Notify(ctx, "🟢 instalker: Instagram is answering again, polling resumed.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to send recovery notice")
 		}
 	}
+}
+
+func isBlockedErr(err error) bool {
+	return isAuthErr(err) || errors.Is(err, domain.ErrRateLimited)
 }
 
 func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
@@ -185,9 +197,9 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 		log.Info().Str("target", target.Username).Int("baselined", fresh).Msg("baseline established, future media will be forwarded")
 	}
 
-	// One failed feed is still worth returning when it failed on auth: that
-	// means the session is broken, not that the feed was empty.
-	if isAuthErr(postsErr) || isAuthErr(storiesErr) {
+	// One failed feed is still worth returning when Instagram is the reason:
+	// that means the session or the host is blocked, not that the feed is empty.
+	if isBlockedErr(postsErr) || isBlockedErr(storiesErr) {
 		return errors.Join(postsErr, storiesErr)
 	}
 
