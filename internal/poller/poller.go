@@ -32,6 +32,7 @@ type mediaRepo interface {
 
 type sender interface {
 	Send(ctx context.Context, media domain.Media) error
+	Notify(ctx context.Context, text string) error
 }
 
 // Poller watches a fixed set of Instagram accounts and forwards anything new.
@@ -41,6 +42,10 @@ type Poller struct {
 	sender   sender
 	targets  []domain.User
 	interval time.Duration
+
+	// authAlerted keeps a broken session from re-alerting on every tick. It is
+	// only touched from the single goroutine running Run.
+	authAlerted bool
 }
 
 // New builds a poller over an already resolved set of targets.
@@ -74,6 +79,8 @@ func (p *Poller) Run(ctx context.Context) error {
 }
 
 func (p *Poller) cycle(ctx context.Context) {
+	authBroken := false
+
 	for _, target := range p.targets {
 		if ctx.Err() != nil {
 			return
@@ -82,10 +89,37 @@ func (p *Poller) cycle(ctx context.Context) {
 		err := p.pollTarget(ctx, target)
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Msg("poll cycle failed for target")
+
+			if errors.Is(err, domain.ErrUnauthorized) || errors.Is(err, domain.ErrCheckpointRequired) {
+				authBroken = true
+			}
 		}
 	}
 
+	p.reportAuthState(ctx, authBroken)
 	metrics.IncPollCycle()
+}
+
+// reportAuthState tells the chat when the Instagram session stops being
+// accepted, and again when it recovers. Without this the bot polls into the
+// void: the logs fill up but nobody is watching them.
+func (p *Poller) reportAuthState(ctx context.Context, authBroken bool) {
+	switch {
+	case authBroken && !p.authAlerted:
+		p.authAlerted = true
+		err := p.sender.Notify(ctx, "🔴 instalker: Instagram is refusing the session, so polling is stalled.\n\n"+
+			"Log in to instagram.com in a browser, copy a fresh <code>sessionid</code> cookie into the "+
+			"<code>IG_SESSIONID</code> secret and restart the bot.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to send auth alert")
+		}
+	case !authBroken && p.authAlerted:
+		p.authAlerted = false
+		err := p.sender.Notify(ctx, "🟢 instalker: Instagram session accepted again, polling resumed.")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to send auth recovery notice")
+		}
+	}
 }
 
 func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
@@ -141,7 +175,9 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 		}
 	}
 
-	if !initialized {
+	// Baselining off a half-fetched target would mark only what was reachable as
+	// seen, and the missing feed would later arrive as a flood of "new" media.
+	if !initialized && postsErr == nil && storiesErr == nil {
 		err = p.repo.MarkInitialized(ctx, target)
 		if err != nil {
 			return err
@@ -149,7 +185,17 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 		log.Info().Str("target", target.Username).Int("baselined", fresh).Msg("baseline established, future media will be forwarded")
 	}
 
+	// One failed feed is still worth returning when it failed on auth: that
+	// means the session is broken, not that the feed was empty.
+	if isAuthErr(postsErr) || isAuthErr(storiesErr) {
+		return errors.Join(postsErr, storiesErr)
+	}
+
 	return nil
+}
+
+func isAuthErr(err error) bool {
+	return errors.Is(err, domain.ErrUnauthorized) || errors.Is(err, domain.ErrCheckpointRequired)
 }
 
 func reverse(media []domain.Media) []domain.Media {

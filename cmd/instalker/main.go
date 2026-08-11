@@ -56,7 +56,9 @@ func run(cfg config.Config) error {
 
 	insta, me, err := authenticate(ctx, cfg)
 	if err != nil {
-		if errors.Is(err, domain.ErrCheckpointRequired) {
+		// A rejected session is just as fatal as a challenge, and just as
+		// invisible from the chat unless it is reported there.
+		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
 			notifyCheckpoint(ctx, telegram, cfg, err)
 		}
 		return err

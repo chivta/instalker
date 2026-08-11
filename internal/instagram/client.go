@@ -134,22 +134,27 @@ func (c *Client) decorate(req *http.Request) {
 
 // statusError maps an HTTP status onto a domain sentinel. Instagram answers
 // with 200 far more often than it should, so the body is inspected too.
+//
+// Every branch carries the status and a body excerpt: an "unauthorized" with no
+// detail is impossible to tell apart from a rate limit dressed up as a login
+// wall, which is exactly the ambiguity that matters when the session works from
+// one network and not another.
 func statusError(status int, body []byte) error {
 	switch {
 	case status == http.StatusOK:
 		if strings.Contains(string(body), "checkpoint_required") {
-			return domain.ErrCheckpointRequired
+			return fmt.Errorf("%w: status 200: %s", domain.ErrCheckpointRequired, truncate(string(body), 300))
 		}
 		if strings.Contains(string(body), "login_required") {
-			return domain.ErrUnauthorized
+			return fmt.Errorf("%w: status 200 login_required: %s", domain.ErrUnauthorized, truncate(string(body), 300))
 		}
 		return nil
 	case status == http.StatusNotFound:
 		return domain.ErrNotFound
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
-		return domain.ErrUnauthorized
+		return fmt.Errorf("%w: status %d: %s", domain.ErrUnauthorized, status, truncate(string(body), 300))
 	case status == http.StatusTooManyRequests:
-		return domain.ErrRateLimited
+		return fmt.Errorf("%w: status 429: %s", domain.ErrRateLimited, truncate(string(body), 300))
 	default:
 		return fmt.Errorf("%w: status %d: %s", domain.ErrBadResponse, status, truncate(string(body), 300))
 	}

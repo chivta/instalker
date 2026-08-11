@@ -2,6 +2,8 @@ package poller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,8 +11,10 @@ import (
 )
 
 type fakeInsta struct {
-	posts   []domain.Media
-	stories []domain.Media
+	posts      []domain.Media
+	stories    []domain.Media
+	postsErr   error
+	storiesErr error
 }
 
 func (f *fakeInsta) Profile(context.Context, string) (domain.User, error) {
@@ -22,11 +26,11 @@ func (f *fakeInsta) Following(context.Context, string) ([]domain.User, error) {
 }
 
 func (f *fakeInsta) Posts(context.Context, domain.User) ([]domain.Media, error) {
-	return f.posts, nil
+	return f.posts, f.postsErr
 }
 
 func (f *fakeInsta) Stories(context.Context, domain.User) ([]domain.Media, error) {
-	return f.stories, nil
+	return f.stories, f.storiesErr
 }
 
 type fakeRepo struct {
@@ -53,11 +57,17 @@ func (f *fakeRepo) MarkInitialized(context.Context, domain.User) error {
 }
 
 type fakeSender struct {
-	sent []domain.Media
+	sent    []domain.Media
+	notices []string
 }
 
 func (f *fakeSender) Send(_ context.Context, m domain.Media) error {
 	f.sent = append(f.sent, m)
+	return nil
+}
+
+func (f *fakeSender) Notify(_ context.Context, text string) error {
+	f.notices = append(f.notices, text)
 	return nil
 }
 
@@ -172,4 +182,62 @@ func ids(media []domain.Media) []string {
 	}
 
 	return out
+}
+
+func TestAuthFailureAlertsOnceAndRecovers(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	insta := &fakeInsta{
+		postsErr:   fmt.Errorf("posts target: %w", domain.ErrUnauthorized),
+		storiesErr: fmt.Errorf("stories target: %w", domain.ErrUnauthorized),
+	}
+	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+
+	// cycle short-circuits on a cancelled context, so this one must stay live.
+	// No media is delivered in either phase, so there is no send delay to wait on.
+	ctx := context.Background()
+
+	// Two broken cycles must produce exactly one alert, not one per tick.
+	p.cycle(ctx)
+	p.cycle(ctx)
+
+	if len(sender.notices) != 1 {
+		t.Fatalf("got %d notices, want 1: %v", len(sender.notices), sender.notices)
+	}
+	if !strings.Contains(sender.notices[0], "refusing the session") {
+		t.Errorf("alert did not mention the session: %q", sender.notices[0])
+	}
+
+	// Recovery is announced once.
+	insta.postsErr, insta.storiesErr = nil, nil
+	p.cycle(ctx)
+	p.cycle(ctx)
+
+	if len(sender.notices) != 2 {
+		t.Fatalf("got %d notices after recovery, want 2: %v", len(sender.notices), sender.notices)
+	}
+	if !strings.Contains(sender.notices[1], "resumed") {
+		t.Errorf("recovery notice unexpected: %q", sender.notices[1])
+	}
+}
+
+func TestPartialFetchDoesNotBaseline(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}}
+	sender := &fakeSender{}
+	insta := &fakeInsta{
+		posts:      []domain.Media{media("p1", domain.KindPost, owner)},
+		storiesErr: fmt.Errorf("stories target: %w", domain.ErrUnauthorized),
+	}
+	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_ = p.pollTarget(ctx, owner)
+
+	if repo.initialized {
+		t.Fatal("target was baselined despite a failed feed")
+	}
 }
