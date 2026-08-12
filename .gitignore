@@ -9,3 +9,4 @@ secrets.yaml
 .e2e-session.json
 .e2e-code
 .e2e-2fa
+test/e2e/

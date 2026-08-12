@@ -56,32 +56,18 @@ anything else is ignored.
 
 ## End-to-end tests
 
-`test/e2e` drives the bot from a **real Telegram account** over MTProto
-(`gotd/td`), which is the only way to check the things unit tests cannot: whether
-the bot is reachable at all, whether a command is routed, and what the chat
-actually ends up showing.
+There is a local-only harness that drives the bot from a real Telegram account
+over MTProto, covering what unit tests cannot: whether commands are routed,
+answered, and authorised at all.
 
-They are behind a build tag and never run in CI:
+It is **not in this repository**. It needs a live user-account session, which
+does not belong in version control or CI, so `test/e2e/` is gitignored and lives
+as its own Go module — that keeps this project's `go.mod` free of test-only
+dependencies. See the `telegram-bot-e2e` skill to provision it.
 
 ```sh
-go run ./test/e2e/login        # once: interactive, writes the session file
-go test -tags e2e ./test/e2e/ -v
+cd test/e2e && go test -tags e2e ./... -v
 ```
-
-Credentials are shared across projects and live in `~/.config/tgtest/env`; see
-the `telegram-bot-e2e` skill for the setup. A project-local `.env.e2e` overrides
-them when present.
-
-The login step cannot be automated — Telegram sends the code to the account
-itself. Everything after it reuses the stored session.
-
-The bot under test runs with **no Instagram credentials**, so scraping fails by
-design. That is the fixture: it reaches its command listener and stalls at target
-resolution, which is exactly the state in which commands matter most. Polling and
-media delivery are not covered here.
-
-Use a **separate staging bot** and a spare account. Two clients polling one token
-fight over updates, and the loser silently never sees them.
 
 ## Configuration
 
