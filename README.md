@@ -54,6 +54,32 @@ once processed.
 Commands are only accepted from `CHAT_ID`; the bot's username is public, so
 anything else is ignored.
 
+## End-to-end tests
+
+`test/e2e` drives the bot from a **real Telegram account** over MTProto
+(`gotd/td`), which is the only way to check the things unit tests cannot: whether
+the bot is reachable at all, whether a command is routed, and what the chat
+actually ends up showing.
+
+They are behind a build tag and never run in CI:
+
+```sh
+cp .env.e2e.example .env.e2e   # fill in, see the comments there
+go run ./test/e2e/login        # once: interactive, writes the session file
+go test -tags e2e ./test/e2e/ -v
+```
+
+The login step cannot be automated — Telegram sends the code to the account
+itself. Everything after it reuses the stored session.
+
+The bot under test runs with **no Instagram credentials**, so scraping fails by
+design. That is the fixture: it reaches its command listener and stalls at target
+resolution, which is exactly the state in which commands matter most. Polling and
+media delivery are not covered here.
+
+Use a **separate staging bot** and a spare account. Two clients polling one token
+fight over updates, and the loser silently never sees them.
+
 ## Configuration
 
 Copy `.example.env` to `.env` and fill it in. Every variable is documented there.

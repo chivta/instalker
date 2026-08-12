@@ -5,3 +5,5 @@ data/
 .tmp/
 .env.secrets
 secrets.yaml
+.env.e2e
+.e2e-session.json
