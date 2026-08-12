@@ -64,10 +64,13 @@ actually ends up showing.
 They are behind a build tag and never run in CI:
 
 ```sh
-cp .env.e2e.example .env.e2e   # fill in, see the comments there
 go run ./test/e2e/login        # once: interactive, writes the session file
 go test -tags e2e ./test/e2e/ -v
 ```
+
+Credentials are shared across projects and live in `~/.config/tgtest/env`; see
+the `telegram-bot-e2e` skill for the setup. A project-local `.env.e2e` overrides
+them when present.
 
 The login step cannot be automated — Telegram sends the code to the account
 itself. Everything after it reuses the stored session.

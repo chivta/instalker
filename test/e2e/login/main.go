@@ -75,7 +75,7 @@ func run() error {
 
 		fmt.Printf("\nlogged in as @%s (id %d)\n", self.Username, self.ID)
 		fmt.Printf("session written to %s\n", cfg.SessionFile)
-		fmt.Printf("\nadd this to %s:\n  TG_USER_ID=%d\n", tgtest.ConfigFile, self.ID)
+		fmt.Printf("\nthe chat id is derived from this account at run time; nothing else to configure\n")
 
 		return nil
 	})

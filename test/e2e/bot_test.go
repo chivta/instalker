@@ -13,8 +13,6 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,28 +40,31 @@ const (
 func TestBot(t *testing.T) {
 	cfg, err := tgtest.LoadConfig()
 	if err != nil {
-		t.Skipf("end-to-end tests need %s: %v", tgtest.ConfigFile, err)
+		t.Skipf("end-to-end tests need Telegram credentials: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	botUsername, err := tgtest.BotUsername(ctx, cfg.StagingBotToken)
+	botUsername, err := tgtest.BotUsername(ctx, cfg.BotToken)
 	if err != nil {
 		t.Fatalf("staging bot token: %v", err)
 	}
 	t.Logf("driving @%s", botUsername)
 
 	err = tgtest.Run(ctx, cfg, botUsername, func(ctx context.Context, user *tgtest.User) error {
-		bot := startBot(t, cfg, user.SelfID())
-		defer bot.stop()
+		bot, dbPath := startBot(t, cfg, user.SelfID())
+		defer bot.Stop()
 
 		// /start also creates the conversation, which a bot cannot do itself.
 		err := user.Send(ctx, "/start")
 		if err != nil {
 			return err
 		}
-		bot.waitForLog(t, "telegram command listener started", startupWindow)
+		err = bot.WaitForLog("telegram command listener started", startupWindow)
+		if err != nil {
+			t.Fatalf("startup: %v", err)
+		}
 
 		t.Run("ping reports that polling has not started", func(t *testing.T) {
 			reply, err := user.Ask(ctx, "/ping", "Not polling yet", replyTimeout)
@@ -104,10 +105,10 @@ func TestBot(t *testing.T) {
 			if err != nil {
 				// The bot logs why the delete failed; without it this is
 				// indistinguishable from the bot never trying.
-				t.Errorf("the message carrying the session cookie was not deleted: %v\n--- bot log ---\n%s", err, bot.logs())
+				t.Errorf("the message carrying the session cookie was not deleted: %v\n--- bot log ---\n%s", err, bot.Logs())
 			}
 
-			stored := bot.storedSession(t)
+			stored := storedSession(t, dbPath)
 			if stored != sampleSession {
 				t.Errorf("stored session = %q, want the one that was sent", stored)
 			}
@@ -126,23 +127,26 @@ func TestBot(t *testing.T) {
 func TestBotIgnoresOtherChats(t *testing.T) {
 	cfg, err := tgtest.LoadConfig()
 	if err != nil {
-		t.Skipf("end-to-end tests need %s: %v", tgtest.ConfigFile, err)
+		t.Skipf("end-to-end tests need Telegram credentials: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	botUsername, err := tgtest.BotUsername(ctx, cfg.StagingBotToken)
+	botUsername, err := tgtest.BotUsername(ctx, cfg.BotToken)
 	if err != nil {
 		t.Fatalf("staging bot token: %v", err)
 	}
 
 	err = tgtest.Run(ctx, cfg, botUsername, func(ctx context.Context, user *tgtest.User) error {
 		// Configured for someone else entirely.
-		bot := startBot(t, cfg, user.SelfID()+1)
-		defer bot.stop()
+		bot, _ := startBot(t, cfg, user.SelfID()+1)
+		defer bot.Stop()
 
-		bot.waitForLog(t, "telegram command listener started", startupWindow)
+		err = bot.WaitForLog("telegram command listener started", startupWindow)
+		if err != nil {
+			t.Fatalf("startup: %v", err)
+		}
 
 		err := user.Send(ctx, "/ping")
 		if err != nil {
@@ -158,7 +162,7 @@ func TestBotIgnoresOtherChats(t *testing.T) {
 			t.Errorf("bot answered a chat it is not configured for: %q", reply)
 		}
 
-		if !strings.Contains(bot.logs(), "ignoring command from an unknown chat") {
+		if !strings.Contains(bot.Logs(), "ignoring command from an unknown chat") {
 			t.Error("the rejected command was not logged")
 		}
 
@@ -167,19 +171,4 @@ func TestBotIgnoresOtherChats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("telegram session: %v", err)
 	}
-}
-
-// buildBinary compiles the bot once per run.
-func buildBinary(t *testing.T) string {
-	t.Helper()
-
-	binary := filepath.Join(t.TempDir(), "instalker")
-
-	build := exec.Command("go", "build", "-o", binary, "../../cmd/instalker")
-	out, err := build.CombinedOutput()
-	if err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-
-	return binary
 }
