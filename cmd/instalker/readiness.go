@@ -54,7 +54,9 @@ func (r *readiness) probe(ctx context.Context) (domain.Probe, error) {
 		if err == nil {
 			err = errStartingUp
 		}
-		return domain.Probe{}, fmt.Errorf("not polling yet: %w", err)
+		// The reply already says polling has not started; this only has to
+		// carry the reason.
+		return domain.Probe{}, fmt.Errorf("startup: %w", err)
 	}
 
 	return watcher.Probe(ctx), nil

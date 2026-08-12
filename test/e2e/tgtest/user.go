@@ -9,11 +9,15 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 const (
 	// replyPoll is how often the chat is re-read while waiting for the bot.
-	replyPoll = time.Second
+	// Polling faster trips Telegram's flood control for no benefit.
+	replyPoll = 3 * time.Second
+	// floodRetries bounds how many times a FLOOD_WAIT is waited out.
+	floodRetries = 3
 	// historyLimit is how many recent messages are inspected per poll.
 	historyLimit = 20
 )
@@ -80,22 +84,35 @@ func (u *User) Send(ctx context.Context, text string) error {
 	return nil
 }
 
-// WaitForReply blocks until the bot sends a message containing want, and
-// returns it. The whole point of these tests is what the chat ends up showing,
-// so matching is on the visible text.
-func (u *User) WaitForReply(ctx context.Context, want string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	seen := map[int]bool{}
-
-	// Ignore anything already in the chat, so a previous run's reply cannot
-	// satisfy this wait.
+// Ask sends a command and waits for the reply it provokes.
+//
+// The chat is snapshotted before sending, not after: the bot often answers in
+// under a second, and a snapshot taken afterwards would file that reply under
+// "already there" and then wait for it forever.
+func (u *User) Ask(ctx context.Context, command, want string, timeout time.Duration) (string, error) {
 	before, err := u.incoming(ctx)
 	if err != nil {
 		return "", err
 	}
+
+	seen := make(map[int]bool, len(before))
 	for _, m := range before {
 		seen[m.ID] = true
 	}
+
+	err = u.Send(ctx, command)
+	if err != nil {
+		return "", err
+	}
+
+	return u.waitForReply(ctx, seen, want, timeout)
+}
+
+// waitForReply blocks until the bot sends a message containing want. The whole
+// point of these tests is what the chat ends up showing, so matching is on the
+// visible text.
+func (u *User) waitForReply(ctx context.Context, seen map[int]bool, want string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
 
 	for {
 		messages, err := u.incoming(ctx)
@@ -124,48 +141,73 @@ func (u *User) WaitForReply(ctx context.Context, want string, timeout time.Durat
 	}
 }
 
-// ExpectSilence fails if the bot answers at all within the window, which is how
-// "commands from other chats are ignored" is checked.
-func (u *User) ExpectSilence(ctx context.Context, window time.Duration) error {
+// Silence watches for a reply that should never come, which is how "commands
+// from other chats are ignored" is checked.
+//
+// It returns the offending reply separately from the error so a rate limit
+// cannot be mistaken for the bot answering — the two call for opposite
+// reactions, and conflating them turns an infrastructure hiccup into a false
+// report of a security hole.
+func (u *User) Silence(ctx context.Context, window time.Duration) (reply string, err error) {
 	before, err := u.incoming(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	baseline := len(before)
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	case <-time.After(window):
 	}
 
 	after, err := u.incoming(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if len(after) > baseline {
-		return fmt.Errorf("expected no reply, got %q", lastText(after))
+		return lastText(after), nil
 	}
 
-	return nil
+	return "", nil
 }
 
-// SentMessageExists reports whether a message the user sent is still in the
-// chat, used to check that the bot deleted a credential.
-func (u *User) SentMessageExists(ctx context.Context, text string) (bool, error) {
-	messages, err := u.history(ctx)
-	if err != nil {
-		return false, err
-	}
+// WaitForSentMessageGone blocks until a message the user sent is no longer in
+// the chat, used to check that the bot deleted a credential.
+//
+// The bot answers before it deletes, so checking the instant the reply lands
+// is a coin flip; the deletion is what matters, not its exact timing.
+func (u *User) WaitForSentMessageGone(ctx context.Context, text string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 
-	for _, m := range messages {
-		if m.Out && m.Message == text {
-			return true, nil
+	for {
+		messages, err := u.history(ctx)
+		if err != nil {
+			return err
+		}
+
+		found := false
+		for _, m := range messages {
+			if m.Out && m.Message == text {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("message was still in the chat after %s", timeout)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(replyPoll):
 		}
 	}
-
-	return false, nil
 }
 
 // incoming returns messages sent by the bot, newest first.
@@ -186,12 +228,9 @@ func (u *User) incoming(ctx context.Context) ([]*tg.Message, error) {
 }
 
 func (u *User) history(ctx context.Context) ([]*tg.Message, error) {
-	res, err := u.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-		Peer:  u.bot,
-		Limit: historyLimit,
-	})
+	res, err := u.getHistory(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get history: %w", err)
+		return nil, err
 	}
 
 	modified, ok := res.AsModified()
@@ -209,6 +248,37 @@ func (u *User) history(ctx context.Context) ([]*tg.Message, error) {
 	}
 
 	return out, nil
+}
+
+// getHistory fetches the chat, waiting out Telegram's flood control.
+//
+// Polling a chat is exactly the pattern that trips FLOOD_WAIT, and a test that
+// fails on it reports a rate limit as though the bot misbehaved. Telegram says
+// how long to wait, so wait.
+func (u *User) getHistory(ctx context.Context) (tg.MessagesMessagesClass, error) {
+	for attempt := 1; ; attempt++ {
+		res, err := u.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:  u.bot,
+			Limit: historyLimit,
+		})
+		if err == nil {
+			return res, nil
+		}
+
+		wait, isFlood := tgerr.AsFloodWait(err)
+		if !isFlood || attempt > floodRetries {
+			return nil, fmt.Errorf("get history: %w", err)
+		}
+
+		// Telegram's figure is a floor, so add a margin.
+		wait += time.Second
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }
 
 func resolveBot(ctx context.Context, api *tg.Client, username string) (tg.InputPeerClass, error) {

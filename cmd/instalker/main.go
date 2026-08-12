@@ -29,6 +29,10 @@ const (
 	// transient Instagram failure; the delay doubles between attempts.
 	authRetryAttempts = 4
 	authRetryDelay    = 30 * time.Second
+
+	// startupRetryDelay is how long a startup blocked on a human-supplied
+	// session waits before trying again on its own.
+	startupRetryDelay = 5 * time.Minute
 )
 
 func main() {
@@ -88,7 +92,23 @@ func run(cfg config.Config) error {
 	// /session are needed.
 	var ready readiness
 	telegram.HandlePing(ctx, ready.probe)
-	telegram.HandleSession(ctx, sessions.Update)
+
+	// A new session is what unblocks a stalled startup, so the startup loop is
+	// told the moment one arrives rather than waiting out its retry delay.
+	sessionChanged := make(chan struct{}, 1)
+	telegram.HandleSession(ctx, func(ctx context.Context, sessionID string) error {
+		err := sessions.Update(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+
+		select {
+		case sessionChanged <- struct{}{}:
+		default:
+		}
+
+		return nil
+	})
 
 	commandErr := make(chan error, 1)
 	go func() {
@@ -99,35 +119,12 @@ func run(cfg config.Config) error {
 		<-commandErr
 	}()
 
-	me, err := authenticate(ctx, cfg, insta, sessions)
+	me, targets, err := awaitStartup(ctx, cfg, insta, sessions, telegram, &ready, sessionChanged)
 	if err != nil {
-		ready.stalled(err)
-		// A rejected session is just as fatal as a challenge, and just as
-		// invisible from the chat unless it is reported there.
-		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
-			notifyLoginFailure(ctx, telegram, cfg, err)
-		}
 		return err
 	}
 	log.Info().Str("username", me.Username).Str("pk", me.PK).Msg("instagram session ready")
 
-	// This is the first call that actually exercises the session, so it is the
-	// one that gets the retry budget.
-	var targets []domain.User
-	err = withBackoff(ctx, "resolve targets", func() error {
-		var resolveErr error
-		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, cfg.Targets)
-		// Each attempt updates what /ping reports, so a session pasted during
-		// the retry window is reflected on the next answer.
-		ready.stalled(resolveErr)
-		return resolveErr
-	})
-	if err != nil {
-		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
-			notifyLoginFailure(ctx, telegram, cfg, err)
-		}
-		return err
-	}
 	for _, t := range targets {
 		log.Info().Str("username", t.Username).Str("pk", t.PK).Bool("private", t.IsPrivate).Msg("watching target")
 	}
@@ -146,6 +143,88 @@ func run(cfg config.Config) error {
 	log.Info().Msg("shutdown complete")
 
 	return err
+}
+
+// awaitStartup authenticates and resolves targets, staying alive when the only
+// thing that can fix the failure is a human sending a new session.
+//
+// Exiting there would be self-defeating: the bot's own message tells you to
+// send /session, and a dead process cannot receive it. So a rejected session or
+// a pending challenge parks the bot with its commands still served, and any
+// /session retries immediately.
+func awaitStartup(
+	ctx context.Context,
+	cfg config.Config,
+	insta *instagram.Client,
+	sessions *session.Manager,
+	telegram *notifier.Telegram,
+	ready *readiness,
+	sessionChanged <-chan struct{},
+) (domain.User, []domain.User, error) {
+	notified := false
+
+	for {
+		me, targets, err := tryStartup(ctx, cfg, insta, sessions, ready)
+		if err == nil {
+			return me, targets, nil
+		}
+
+		ready.stalled(err)
+		log.Error().Err(err).Msg("startup failed")
+
+		// Anything else — throttling, a bad response — is better handled by
+		// exiting and letting the supervisor back off and retry.
+		if !errors.Is(err, domain.ErrUnauthorized) && !errors.Is(err, domain.ErrCheckpointRequired) {
+			return domain.User{}, nil, err
+		}
+
+		if !notified {
+			notifyLoginFailure(ctx, telegram, cfg, err)
+			notified = true
+		}
+
+		log.Warn().Dur("retry_in", startupRetryDelay).Msg("waiting for a new session before retrying startup")
+
+		select {
+		case <-ctx.Done():
+			return domain.User{}, nil, ctx.Err()
+		case <-sessionChanged:
+			log.Info().Msg("session replaced, retrying startup")
+			notified = false
+		case <-time.After(startupRetryDelay):
+		}
+	}
+}
+
+// tryStartup is one attempt at becoming ready to poll.
+func tryStartup(
+	ctx context.Context,
+	cfg config.Config,
+	insta *instagram.Client,
+	sessions *session.Manager,
+	ready *readiness,
+) (domain.User, []domain.User, error) {
+	me, err := authenticate(ctx, cfg, insta, sessions)
+	if err != nil {
+		return domain.User{}, nil, err
+	}
+
+	// This is the first call that actually exercises the session, so it is the
+	// one that gets the retry budget.
+	var targets []domain.User
+	err = withBackoff(ctx, "resolve targets", func() error {
+		var resolveErr error
+		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, cfg.Targets)
+		// Each attempt updates what /ping reports, so a session pasted during
+		// the retry window is reflected on the next answer.
+		ready.stalled(resolveErr)
+		return resolveErr
+	})
+	if err != nil {
+		return domain.User{}, nil, err
+	}
+
+	return me, targets, nil
 }
 
 // authenticate puts a session on the client: the stored one when there is one,

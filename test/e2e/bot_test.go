@@ -12,6 +12,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -29,10 +30,13 @@ const (
 	silenceWindow = 20 * time.Second
 	// startupWindow is how long the bot gets to begin serving commands.
 	startupWindow = 30 * time.Second
+	// deletionTimeout is how long the bot gets to remove the message carrying
+	// a credential, which it does after replying.
+	deletionTimeout = 30 * time.Second
 
-	// sampleSession is well-formed but not a real cookie, so it is accepted by
-	// validation and rejected by Instagram.
-	sampleSession = "10000000001%3AAaAaAaAaAaAaAa%3A25%3AFakeTokenValue"
+	// sessionPrefix builds a value that is well-formed but not a real cookie,
+	// so it is accepted by validation and rejected by Instagram.
+	sessionPrefix = "10000000001%3AAaAaAaAaAaAaAa%3A25%3AFake"
 )
 
 func TestBot(t *testing.T) {
@@ -62,12 +66,7 @@ func TestBot(t *testing.T) {
 		bot.waitForLog(t, "telegram command listener started", startupWindow)
 
 		t.Run("ping reports that polling has not started", func(t *testing.T) {
-			err := user.Send(ctx, "/ping")
-			if err != nil {
-				t.Fatalf("send: %v", err)
-			}
-
-			reply, err := user.WaitForReply(ctx, "Not polling yet", replyTimeout)
+			reply, err := user.Ask(ctx, "/ping", "Not polling yet", replyTimeout)
 			if err != nil {
 				t.Fatalf("ping: %v", err)
 			}
@@ -75,49 +74,37 @@ func TestBot(t *testing.T) {
 		})
 
 		t.Run("session without a payload explains itself", func(t *testing.T) {
-			err := user.Send(ctx, "/session")
-			if err != nil {
-				t.Fatalf("send: %v", err)
-			}
-
-			_, err = user.WaitForReply(ctx, "Send the cookie with the command", replyTimeout)
+			_, err := user.Ask(ctx, "/session", "Send the cookie with the command", replyTimeout)
 			if err != nil {
 				t.Fatalf("session usage: %v", err)
 			}
 		})
 
 		t.Run("malformed session is rejected", func(t *testing.T) {
-			err := user.Send(ctx, "/session obviously-not-a-cookie")
-			if err != nil {
-				t.Fatalf("send: %v", err)
-			}
-
-			_, err = user.WaitForReply(ctx, "does not look like a session cookie", replyTimeout)
+			_, err := user.Ask(ctx, "/session obviously-not-a-cookie", "does not look like a session cookie", replyTimeout)
 			if err != nil {
 				t.Fatalf("malformed session: %v", err)
 			}
 		})
 
 		t.Run("well-formed session is stored and its message deleted", func(t *testing.T) {
+			// The value is unique per run. Messages are matched by their text,
+			// and an identical command left over from an earlier run would
+			// satisfy the "still in the chat" check forever.
+			sampleSession := fmt.Sprintf("%s%d", sessionPrefix, time.Now().UnixNano())
 			command := "/session " + sampleSession
 
-			err := user.Send(ctx, command)
-			if err != nil {
-				t.Fatalf("send: %v", err)
-			}
-
-			_, err = user.WaitForReply(ctx, "Session updated and saved", replyTimeout)
+			_, err := user.Ask(ctx, command, "Session updated and saved", replyTimeout)
 			if err != nil {
 				t.Fatalf("session update: %v", err)
 			}
 
 			// The message carried a credential and must not survive in the chat.
-			stillThere, err := user.SentMessageExists(ctx, command)
+			err = user.WaitForSentMessageGone(ctx, command, deletionTimeout)
 			if err != nil {
-				t.Fatalf("history: %v", err)
-			}
-			if stillThere {
-				t.Error("the message carrying the session cookie was not deleted")
+				// The bot logs why the delete failed; without it this is
+				// indistinguishable from the bot never trying.
+				t.Errorf("the message carrying the session cookie was not deleted: %v\n--- bot log ---\n%s", err, bot.logs())
 			}
 
 			stored := bot.storedSession(t)
@@ -162,9 +149,13 @@ func TestBotIgnoresOtherChats(t *testing.T) {
 			return err
 		}
 
-		err = user.ExpectSilence(ctx, silenceWindow)
+		reply, err := user.Silence(ctx, silenceWindow)
 		if err != nil {
-			t.Errorf("bot answered a chat it is not configured for: %v", err)
+			// A transport problem is not evidence about the bot either way.
+			t.Fatalf("watching for a reply: %v", err)
+		}
+		if reply != "" {
+			t.Errorf("bot answered a chat it is not configured for: %q", reply)
 		}
 
 		if !strings.Contains(bot.logs(), "ignoring command from an unknown chat") {
