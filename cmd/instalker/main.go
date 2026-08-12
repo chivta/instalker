@@ -82,8 +82,26 @@ func run(cfg config.Config) error {
 
 	sessions := session.New(storage.NewStateRepo(db), insta)
 
+	// Commands are served from here on, before Instagram is contacted. Startup
+	// can spend minutes retrying a throttled Instagram, and a bot that only
+	// starts listening after that succeeds is silent exactly when /ping and
+	// /session are needed.
+	var ready readiness
+	telegram.HandlePing(ctx, ready.probe)
+	telegram.HandleSession(ctx, sessions.Update)
+
+	commandErr := make(chan error, 1)
+	go func() {
+		commandErr <- telegram.Run(ctx)
+	}()
+	defer func() {
+		stop()
+		<-commandErr
+	}()
+
 	me, err := authenticate(ctx, cfg, insta, sessions)
 	if err != nil {
+		ready.stalled(err)
 		// A rejected session is just as fatal as a challenge, and just as
 		// invisible from the chat unless it is reported there.
 		if errors.Is(err, domain.ErrCheckpointRequired) || errors.Is(err, domain.ErrUnauthorized) {
@@ -99,6 +117,9 @@ func run(cfg config.Config) error {
 	err = withBackoff(ctx, "resolve targets", func() error {
 		var resolveErr error
 		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, cfg.Targets)
+		// Each attempt updates what /ping reports, so a session pasted during
+		// the retry window is reflected on the next answer.
+		ready.stalled(resolveErr)
 		return resolveErr
 	})
 	if err != nil {
@@ -113,19 +134,7 @@ func run(cfg config.Config) error {
 
 	repo := storage.NewMediaRepo(db)
 	watcher := poller.New(insta, repo, telegram, targets, cfg.PollInterval)
-
-	// Commands are served alongside polling; /ping reports whether scraping
-	// works right now instead of waiting for the next tick to show up in logs.
-	telegram.HandlePing(ctx, watcher.Probe)
-	telegram.HandleSession(ctx, sessions.Update)
-	commandErr := make(chan error, 1)
-	go func() {
-		commandErr <- telegram.Run(ctx)
-	}()
-	defer func() {
-		stop()
-		<-commandErr
-	}()
+	ready.polling(watcher)
 
 	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> every %s", strings.Join(usernames(targets), "</b>, <b>"), cfg.PollInterval))
 	if err != nil {

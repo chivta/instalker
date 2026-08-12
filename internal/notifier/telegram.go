@@ -97,7 +97,7 @@ func (t *Telegram) Send(ctx context.Context, media domain.Media) error {
 
 // HandlePing wires /ping to a live scrape check. Commands from any other chat
 // are ignored: the bot's username is public, so anyone can message it.
-func (t *Telegram) HandlePing(ctx context.Context, probe func(context.Context) domain.Probe) {
+func (t *Telegram) HandlePing(ctx context.Context, probe func(context.Context) (domain.Probe, error)) {
 	t.bot.Handle("/ping", func(c tele.Context) error {
 		if c.Chat().ID != t.chat.ID {
 			log.Warn().Int64("chat_id", c.Chat().ID).Msg("ignoring command from an unknown chat")
@@ -107,7 +107,14 @@ func (t *Telegram) HandlePing(ctx context.Context, probe func(context.Context) d
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 		defer cancel()
 
-		result := probe(probeCtx)
+		result, err := probe(probeCtx)
+		if err != nil {
+			// Reachable before polling has started, which is when this command
+			// is most worth answering.
+			log.Warn().Err(err).Msg("ping while not polling")
+			return c.Send("🔴 <b>Not polling yet</b>\n"+escape(describeErr(err)), tele.ModeHTML, tele.NoPreview)
+		}
+
 		log.Info().Bool("ok", result.OK()).Dur("elapsed", result.Elapsed).Msg("ping probe finished")
 
 		return c.Send(formatProbe(result), tele.ModeHTML, tele.NoPreview)
