@@ -46,6 +46,11 @@ pending challenge — because those need different responses. The probe delivers
 nothing and does not touch the seen-state, so running it never causes a missed
 or duplicated notification.
 
+`/session <sessionid>` replaces the Instagram session cookie at runtime. The new
+cookie is applied immediately and saved to the database, so rotation needs no
+redeploy and no restart. The message carrying the cookie is deleted from the chat
+once processed.
+
 Commands are only accepted from `CHAT_ID`; the bot's username is public, so
 anything else is ignored.
 
@@ -85,7 +90,11 @@ $EDITOR k8s/secrets.yaml
 sops -e k8s/secrets.yaml > k8s/secrets.enc.yaml
 ```
 
-`IG_SESSIONID` is the value that expires and needs periodic rotation this way.
+**`IG_SESSIONID` is not rotated this way.** It expires on its own schedule, far
+more often than anything else here, so the database on the PVC is its source of
+truth and `/session` is how it is replaced. The environment variable is only a
+bootstrap: it seeds the database the first time there is nothing stored, and is
+ignored from then on. Once seeded it can be emptied.
 
 The registry pull secret is the one thing SOPS does not cover, since it is a
 cluster-level docker config rather than app config:

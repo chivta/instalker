@@ -20,6 +20,7 @@ import (
 	"github.com/arvlas/instalker/internal/metrics"
 	"github.com/arvlas/instalker/internal/notifier"
 	"github.com/arvlas/instalker/internal/poller"
+	"github.com/arvlas/instalker/internal/session"
 	"github.com/arvlas/instalker/internal/storage"
 )
 
@@ -61,6 +62,11 @@ func run(cfg config.Config) error {
 		return err
 	}
 
+	insta, err := instagram.New("")
+	if err != nil {
+		return err
+	}
+
 	// The probe server comes up before Instagram is contacted. Authentication
 	// can retry for minutes when Instagram is throttling, and a container with
 	// nothing listening fails its liveness probe and is killed mid-retry.
@@ -74,7 +80,9 @@ func run(cfg config.Config) error {
 		<-probeErr
 	}()
 
-	insta, me, err := authenticate(ctx, cfg)
+	sessions := session.New(storage.NewStateRepo(db), insta)
+
+	me, err := authenticate(ctx, cfg, insta, sessions)
 	if err != nil {
 		// A rejected session is just as fatal as a challenge, and just as
 		// invisible from the chat unless it is reported there.
@@ -109,6 +117,7 @@ func run(cfg config.Config) error {
 	// Commands are served alongside polling; /ping reports whether scraping
 	// works right now instead of waiting for the next tick to show up in logs.
 	telegram.HandlePing(ctx, watcher.Probe)
+	telegram.HandleSession(ctx, sessions.Update)
 	commandErr := make(chan error, 1)
 	go func() {
 		commandErr <- telegram.Run(ctx)
@@ -130,31 +139,39 @@ func run(cfg config.Config) error {
 	return err
 }
 
-// authenticate prefers a supplied session cookie and only falls back to a
-// password login when none is configured.
-func authenticate(ctx context.Context, cfg config.Config) (*instagram.Client, domain.User, error) {
-	insta, err := instagram.New(cfg.SessionID)
-	if err != nil {
-		return nil, domain.User{}, err
-	}
+// authenticate puts a session on the client: the stored one when there is one,
+// the IG_SESSIONID bootstrap the first time, and a password login only when
+// neither exists.
+//
+// A password login is never a fallback for a session that looks rejected;
+// Instagram answers it with a challenge, which is strictly worse than retrying.
+func authenticate(ctx context.Context, cfg config.Config, insta *instagram.Client, sessions *session.Manager) (domain.User, error) {
+	err := sessions.Load(ctx, cfg.SessionID)
+	if errors.Is(err, domain.ErrNotFound) {
+		log.Info().Msg("no session stored and IG_SESSIONID is empty, attempting a password login")
 
-	// A password login is only attempted when there is no session to use. It is
-	// never a fallback for a session that looks rejected: Instagram answers it
-	// with a challenge, which is strictly worse than retrying.
-	if cfg.SessionID == "" {
 		err = insta.Login(ctx, cfg.Username, cfg.Password)
 		if err != nil {
-			return nil, domain.User{}, err
+			return domain.User{}, err
 		}
+
+		// Keep what the login produced so the next start does not need to log
+		// in again and risk another challenge.
+		storeErr := sessions.Store(ctx, insta.SessionID())
+		if storeErr != nil {
+			log.Error().Err(storeErr).Msg("failed to store the session from the password login")
+		}
+	} else if err != nil {
+		return domain.User{}, err
 	}
 
 	me, err := insta.SessionUser()
 	if err != nil {
-		return nil, domain.User{}, err
+		return domain.User{}, err
 	}
 	me.Username = cfg.Username
 
-	return insta, me, nil
+	return me, nil
 }
 
 // withBackoff retries an operation that failed for a transient reason.
@@ -207,7 +224,8 @@ func notifyLoginFailure(ctx context.Context, telegram *notifier.Telegram, cfg co
 
 	text := fmt.Sprintf(
 		"🔴 instalker cannot log in as <b>%s</b>: %s.\n\n"+
-			"Log in to instagram.com in a browser, clear any challenge, then copy the <code>sessionid</code> cookie into <code>IG_SESSIONID</code> and restart.\n\n<code>%s</code>",
+			"Log in to instagram.com in a browser, clear any challenge, then send the new cookie here as "+
+			"<code>/session &lt;sessionid&gt;</code>.\n\n<code>%s</code>",
 		cfg.Username, reason, cause,
 	)
 

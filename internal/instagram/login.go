@@ -46,11 +46,12 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	if err != nil {
 		return fmt.Errorf("build login request: %w", err)
 	}
-	c.decorate(req)
+	httpClient, csrf := c.snapshot()
+	decorate(req, csrf)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("referer", baseURL+"/accounts/login/")
 
-	res, err := c.http.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("do login request: %w", err)
 	}
@@ -69,11 +70,13 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 
 	switch {
 	case parsed.Authenticated:
-		session := c.cookie("sessionid")
+		session := cookieFrom(httpClient, "sessionid")
 		if session == "" {
 			return fmt.Errorf("%w: login succeeded without a session cookie", domain.ErrBadResponse)
 		}
+		c.mu.Lock()
 		c.sessionID = session
+		c.mu.Unlock()
 		return nil
 	case parsed.Message == "checkpoint_required" || parsed.CheckpointURL != "":
 		return fmt.Errorf("%w: complete the challenge at %s%s", domain.ErrCheckpointRequired, baseURL, parsed.CheckpointURL)
@@ -92,24 +95,13 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 // session looked rejected, and every extra call is one more against whatever
 // budget Instagram is throttling on.
 func (c *Client) SessionUser() (domain.User, error) {
-	if c.sessionID == "" {
+	if c.SessionID() == "" {
 		return domain.User{}, domain.ErrUnauthorized
 	}
 
-	// Browsers store the cookie percent-encoded; tolerate either form.
-	decoded, err := url.QueryUnescape(c.sessionID)
+	pk, err := accountPK(c.SessionID())
 	if err != nil {
-		decoded = c.sessionID
-	}
-
-	pk, _, found := strings.Cut(decoded, ":")
-	if !found || pk == "" {
-		return domain.User{}, fmt.Errorf("%w: session cookie has no account id", domain.ErrUnauthorized)
-	}
-	for _, r := range pk {
-		if r < '0' || r > '9' {
-			return domain.User{}, fmt.Errorf("%w: session cookie account id %q is not numeric", domain.ErrUnauthorized, pk)
-		}
+		return domain.User{}, err
 	}
 
 	return domain.User{PK: pk}, nil
@@ -123,17 +115,23 @@ func (c *Client) primeCSRF(ctx context.Context) error {
 	}
 	req.Header.Set("user-agent", userAgent)
 
-	res, err := c.http.Do(req)
+	httpClient, _ := c.snapshot()
+
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("do csrf request: %w", err)
 	}
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, maxBodySize))
 
-	c.csrfToken = c.cookie("csrftoken")
-	if c.csrfToken == "" {
+	csrf := cookieFrom(httpClient, "csrftoken")
+	if csrf == "" {
 		return fmt.Errorf("%w: no csrftoken cookie issued", domain.ErrBadResponse)
 	}
+
+	c.mu.Lock()
+	c.csrfToken = csrf
+	c.mu.Unlock()
 
 	return nil
 }

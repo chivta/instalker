@@ -87,13 +87,13 @@ func TestSessionUser(t *testing.T) {
 	}{
 		{
 			name:    "percent encoded cookie as copied from a browser",
-			session: "66388470935%3AR1i4JZ5SV9aYa3%3A25%3AAYhaXc1z",
-			wantPK:  "66388470935",
+			session: "10000000001%3AAaAaAaAaAaAaAa%3A25%3AFakeTokenValue",
+			wantPK:  "10000000001",
 		},
 		{
 			name:    "plain cookie",
-			session: "66388470935:R1i4JZ5SV9aYa3:25:AYhaXc1z",
-			wantPK:  "66388470935",
+			session: "10000000001:AaAaAaAaAaAaAa:25:FakeTokenValue",
+			wantPK:  "10000000001",
 		},
 		{
 			name:    "empty session",

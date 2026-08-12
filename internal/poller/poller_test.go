@@ -263,7 +263,7 @@ func TestRateLimitAlertDoesNotAskForNewSession(t *testing.T) {
 		t.Errorf("alert should name throttling, got %q", sender.notices[0])
 	}
 	// Rotating the cookie does not clear a 429, so the alert must not ask for one.
-	if strings.Contains(sender.notices[0], "IG_SESSIONID") {
+	if strings.Contains(sender.notices[0], "/session") {
 		t.Errorf("rate limit alert wrongly asks for a new session: %q", sender.notices[0])
 	}
 }

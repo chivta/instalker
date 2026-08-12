@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arvlas/instalker/internal/domain"
@@ -25,7 +26,13 @@ const (
 )
 
 // Client talks to Instagram's web private API using a logged-in session cookie.
+//
+// The session can be replaced while the client is running (see SetSession), so
+// the fields describing it are guarded. Rotation swaps in a whole new
+// http.Client rather than mutating the live one, which keeps requests already
+// in flight on the jar they started with.
 type Client struct {
+	mu        sync.RWMutex
 	http      *http.Client
 	sessionID string
 	csrfToken string
@@ -34,46 +41,96 @@ type Client struct {
 // New builds a client. sessionID may be empty, in which case Login must be
 // called before any other method.
 func New(sessionID string) (*Client, error) {
-	jar, err := cookiejar.New(nil)
+	httpClient, err := newHTTPClient()
 	if err != nil {
-		return nil, fmt.Errorf("create cookie jar: %w", err)
+		return nil, err
 	}
 
-	c := &Client{
-		// Redirects must be followed: the first authenticated call is bounced
-		// back to itself so Instagram can issue the csrftoken, ds_user_id and
-		// mid cookies that accompany the session.
-		http:      &http.Client{Jar: jar, Timeout: requestTimeout},
-		sessionID: sessionID,
-	}
-
+	c := &Client{http: httpClient, sessionID: sessionID}
 	if sessionID != "" {
-		c.setSessionCookies(sessionID)
+		setSessionCookie(httpClient, sessionID)
 	}
 
 	return c, nil
 }
 
-// SessionID returns the session cookie the client is currently authenticated with.
-func (c *Client) SessionID() string {
-	return c.sessionID
+// newHTTPClient builds a client with its own cookie jar.
+//
+// Redirects must be followed: the first authenticated call is bounced back to
+// itself so Instagram can issue the csrftoken, ds_user_id and mid cookies that
+// accompany the session.
+func newHTTPClient() (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("create cookie jar: %w", err)
+	}
+
+	return &http.Client{Jar: jar, Timeout: requestTimeout}, nil
 }
 
-func (c *Client) setSessionCookies(sessionID string) {
+func setSessionCookie(httpClient *http.Client, sessionID string) {
 	u, _ := url.Parse(baseURL)
-	c.sessionID = sessionID
-	c.http.Jar.SetCookies(u, []*http.Cookie{
+	httpClient.Jar.SetCookies(u, []*http.Cookie{
 		{Name: "sessionid", Value: sessionID, Domain: ".instagram.com", Path: "/"},
 	})
 }
 
-func (c *Client) cookie(name string) string {
+// SessionID returns the session cookie the client is currently using.
+func (c *Client) SessionID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.sessionID
+}
+
+// SetSession swaps in a new session cookie so a rotated cookie takes effect
+// without a restart. The jar is rebuilt from scratch: csrftoken, ds_user_id and
+// mid belong to the previous session, and sending them alongside a new
+// sessionid gets the request rejected.
+func (c *Client) SetSession(sessionID string) error {
+	err := validateSessionID(sessionID)
+	if err != nil {
+		return err
+	}
+
+	httpClient, err := newHTTPClient()
+	if err != nil {
+		return err
+	}
+	setSessionCookie(httpClient, sessionID)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.http = httpClient
+	c.sessionID = sessionID
+	c.csrfToken = ""
+
+	return nil
+}
+
+// snapshot returns the current transport and CSRF token together, so a request
+// cannot be built from a half-rotated session.
+func (c *Client) snapshot() (*http.Client, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	csrf := c.csrfToken
+	if csrf == "" {
+		csrf = cookieFrom(c.http, "csrftoken")
+	}
+
+	return c.http, csrf
+}
+
+func cookieFrom(httpClient *http.Client, name string) string {
 	u, _ := url.Parse(baseURL)
-	for _, ck := range c.http.Jar.Cookies(u) {
+	for _, ck := range httpClient.Jar.Cookies(u) {
 		if ck.Name == name {
 			return ck.Value
 		}
 	}
+
 	return ""
 }
 
@@ -84,9 +141,11 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	c.decorate(req)
 
-	res, err := c.http.Do(req)
+	httpClient, csrf := c.snapshot()
+	decorate(req, csrf)
+
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("do request: %w", err)
 	}
@@ -116,20 +175,50 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	return nil
 }
 
-func (c *Client) decorate(req *http.Request) {
+func decorate(req *http.Request, csrf string) {
 	req.Header.Set("user-agent", userAgent)
 	req.Header.Set("x-ig-app-id", appID)
 	req.Header.Set("x-requested-with", "XMLHttpRequest")
 	req.Header.Set("accept", "*/*")
 	req.Header.Set("referer", baseURL+"/")
 
-	csrf := c.csrfToken
-	if csrf == "" {
-		csrf = c.cookie("csrftoken")
-	}
 	if csrf != "" {
 		req.Header.Set("x-csrftoken", csrf)
 	}
+}
+
+// validateSessionID checks the shape of a session cookie before it is trusted,
+// so a mistyped value is rejected at the point it is supplied rather than
+// surfacing later as an authentication failure.
+func validateSessionID(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("%w: session cookie is empty", domain.ErrUnauthorized)
+	}
+
+	_, err := accountPK(sessionID)
+
+	return err
+}
+
+// accountPK extracts the account id, which is the first field of the cookie.
+func accountPK(sessionID string) (string, error) {
+	// Browsers store the cookie percent-encoded; tolerate either form.
+	decoded, err := url.QueryUnescape(sessionID)
+	if err != nil {
+		decoded = sessionID
+	}
+
+	pk, _, found := strings.Cut(decoded, ":")
+	if !found || pk == "" {
+		return "", fmt.Errorf("%w: session cookie has no account id", domain.ErrUnauthorized)
+	}
+	for _, r := range pk {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("%w: session cookie account id %q is not numeric", domain.ErrUnauthorized, pk)
+		}
+	}
+
+	return pk, nil
 }
 
 // statusError maps an HTTP status onto a domain sentinel. Instagram answers

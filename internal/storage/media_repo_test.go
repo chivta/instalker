@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -96,5 +97,66 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 			t.Fatalf("open %d: %v", i, err)
 		}
 		db.Close()
+	}
+}
+
+func TestStateRepoSession(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	repo := NewStateRepo(db)
+
+	_, err = repo.Session(ctx)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound on an empty store", err)
+	}
+
+	err = repo.SetSession(ctx, "111:aaa:1")
+	if err != nil {
+		t.Fatalf("set session: %v", err)
+	}
+
+	got, err := repo.Session(ctx)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if got != "111:aaa:1" {
+		t.Fatalf("session = %q, want the stored value", got)
+	}
+
+	// Replacing must overwrite rather than fail on the primary key.
+	err = repo.SetSession(ctx, "222:bbb:2")
+	if err != nil {
+		t.Fatalf("replace session: %v", err)
+	}
+
+	got, err = repo.Session(ctx)
+	if err != nil {
+		t.Fatalf("session after replace: %v", err)
+	}
+	if got != "222:bbb:2" {
+		t.Fatalf("session = %q, want the replacement", got)
+	}
+
+	// The session must survive a reopen, which is the entire point of storing it.
+	db.Close()
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+
+	got, err = NewStateRepo(db).Session(ctx)
+	if err != nil {
+		t.Fatalf("session after reopen: %v", err)
+	}
+	if got != "222:bbb:2" {
+		t.Fatalf("session = %q after reopen, want it persisted", got)
 	}
 }

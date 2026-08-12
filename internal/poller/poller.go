@@ -109,8 +109,8 @@ func (p *Poller) reportStall(ctx context.Context, blocked error) {
 		p.authAlerted = true
 
 		text := "🔴 instalker: Instagram is refusing the session, so polling is stalled.\n\n" +
-			"Log in to instagram.com in a browser, copy a fresh <code>sessionid</code> cookie into the " +
-			"<code>IG_SESSIONID</code> secret and restart the bot."
+			"Log in to instagram.com in a browser and send the fresh cookie here as " +
+			"<code>/session &lt;sessionid&gt;</code>."
 		if errors.Is(blocked, domain.ErrRateLimited) {
 			// Rotating the session would not help here, so do not ask for one.
 			text = "🔴 instalker: Instagram is rate limiting this host, so polling is stalled. " +

@@ -39,7 +39,8 @@ func TestFormatProbe(t *testing.T) {
 				},
 			},
 			wantContain: []string{"failing", "rate limited"},
-			wantAbsent:  []string{"IG_SESSIONID"},
+			// Rotating the cookie does not clear a 429, so do not suggest it.
+			wantAbsent: []string{"/session"},
 		},
 		{
 			name: "rejected session",
@@ -48,7 +49,7 @@ func TestFormatProbe(t *testing.T) {
 					{User: target, Err: fmt.Errorf("posts: %w", domain.ErrUnauthorized)},
 				},
 			},
-			wantContain: []string{"failing", "IG_SESSIONID"},
+			wantContain: []string{"failing", "/session"},
 		},
 		{
 			name:        "no targets",

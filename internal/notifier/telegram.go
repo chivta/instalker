@@ -114,11 +114,51 @@ func (t *Telegram) HandlePing(ctx context.Context, probe func(context.Context) d
 	})
 }
 
+// HandleSession wires /session to a session replacement, so a rotated cookie
+// can be supplied from the chat instead of through a redeploy.
+func (t *Telegram) HandleSession(ctx context.Context, update func(context.Context, string) error) {
+	t.bot.Handle("/session", func(c tele.Context) error {
+		if c.Chat().ID != t.chat.ID {
+			log.Warn().Int64("chat_id", c.Chat().ID).Msg("ignoring command from an unknown chat")
+			return nil
+		}
+
+		// The message carries a live credential; remove it from the chat
+		// history regardless of whether it turns out to be valid.
+		defer func() {
+			err := t.bot.Delete(c.Message())
+			if err != nil {
+				log.Warn().Err(err).Msg("could not delete the message carrying the session cookie")
+			}
+		}()
+
+		value := strings.TrimSpace(c.Message().Payload)
+		if value == "" {
+			return c.Send("Send the cookie with the command: <code>/session &lt;sessionid&gt;</code>", tele.ModeHTML)
+		}
+
+		err := update(ctx, value)
+		if err != nil {
+			// The error can quote the value, so it is never echoed back.
+			log.Error().Err(err).Msg("failed to update the instagram session")
+			if errors.Is(err, domain.ErrUnauthorized) {
+				return c.Send("🔴 That does not look like a session cookie. Copy the <code>sessionid</code> value from instagram.com.", tele.ModeHTML)
+			}
+			return c.Send("🔴 Could not store the session, check the logs.", tele.ModeHTML)
+		}
+
+		log.Info().Msg("instagram session replaced from chat")
+
+		return c.Send("✅ Session updated and saved. Run /ping to check it works.", tele.ModeHTML)
+	})
+}
+
 // Run consumes Telegram updates until ctx is cancelled. Sending works without
 // it; only commands need this loop.
 func (t *Telegram) Run(ctx context.Context) error {
 	err := t.bot.SetCommands([]tele.Command{
 		{Text: "ping", Description: "check that Instagram scraping works"},
+		{Text: "session", Description: "replace the Instagram session cookie"},
 	})
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to publish bot commands")
@@ -174,7 +214,7 @@ func describeErr(err error) string {
 	case errors.Is(err, domain.ErrCheckpointRequired):
 		return "Instagram wants a login challenge cleared"
 	case errors.Is(err, domain.ErrUnauthorized):
-		return "session rejected, IG_SESSIONID needs replacing"
+		return "session rejected, send a fresh one with /session"
 	case errors.Is(err, domain.ErrNotFound):
 		return "account not found"
 	default:
