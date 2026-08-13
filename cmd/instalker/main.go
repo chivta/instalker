@@ -61,7 +61,7 @@ func run(cfg config.Config) error {
 	}
 	defer db.Close()
 
-	telegram, err := notifier.NewTelegram(cfg.BotToken, cfg.ChatID)
+	telegram, err := notifier.NewTelegram(cfg.BotToken, cfg.ChatID, cfg.TelegramAPIURL)
 	if err != nil {
 		return err
 	}

@@ -31,12 +31,18 @@ type Telegram struct {
 	chat *tele.Chat
 }
 
-// NewTelegram builds a send-only Telegram client for the given chat.
-func NewTelegram(token string, chatID int64) (*Telegram, error) {
-	bot, err := tele.NewBot(tele.Settings{
+// NewTelegram builds a Telegram client for the given chat. apiURL overrides the
+// Bot API endpoint; empty means the real one.
+func NewTelegram(token string, chatID int64, apiURL string) (*Telegram, error) {
+	settings := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: pollerTimeout},
-	})
+	}
+	if apiURL != "" {
+		settings.URL = apiURL
+	}
+
+	bot, err := tele.NewBot(settings)
 	if err != nil {
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}

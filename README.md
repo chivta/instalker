@@ -54,11 +54,19 @@ once processed.
 Commands are only accepted from `CHAT_ID`; the bot's username is public, so
 anything else is ignored.
 
-## End-to-end tests
+## Testing
 
-There is a local-only harness that drives the bot from a real Telegram account
-over MTProto, covering what unit tests cannot: whether commands are routed,
-answered, and authorised at all.
+`test/offline` drives the whole bot as a real process against a **fake Bot API
+server** (`internal/tgfake`) — no network, no credentials, no Telegram. It runs
+in CI with `go test ./...` and covers what unit tests cannot: whether commands
+are reachable, routed, authorised, and answered, and whether the bot survives
+the API failing under it.
+
+The bot reaches the fake through `TELEGRAM_API_URL`, which is empty in
+production and also serves a self-hosted Bot API or Telegram's test environment.
+
+There is additionally a local-only harness that drives the bot from a real
+Telegram account over MTProto, for checking assumptions about Telegram itself.
 
 It is **not in this repository**. It needs a live user-account session, which
 does not belong in version control or CI, so `test/e2e/` is gitignored and lives

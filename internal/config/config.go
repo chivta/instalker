@@ -19,6 +19,10 @@ type Config struct {
 	// Telegram delivery.
 	BotToken string `env:"BOT_TOKEN" validate:"required"`
 	ChatID   int64  `env:"CHAT_ID"   validate:"required"`
+	// TelegramAPIURL overrides the Bot API endpoint. Empty means the real one;
+	// tests point it at a fake server, and it also serves a self-hosted Bot API
+	// or Telegram's test environment.
+	TelegramAPIURL string `env:"TELEGRAM_API_URL"`
 
 	// Targets pins the watched accounts. When empty they are resolved from the
 	// accounts the logged-in user follows.
