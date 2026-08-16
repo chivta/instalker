@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -12,9 +13,20 @@ import (
 	"github.com/arvlas/instalker/internal/metrics"
 )
 
-// sendDelay spaces out Telegram deliveries so a burst of new media does not
-// trip the bot API rate limit.
-const sendDelay = 2 * time.Second
+const (
+	// sendDelay spaces out Telegram deliveries so a burst of new media does not
+	// trip the bot API rate limit.
+	sendDelay = 2 * time.Second
+
+	// targetGap spaces out the accounts within one cycle.
+	targetGap = 5 * time.Second
+
+	// pollBackoffFactor and maxPollInterval bound how far a throttled poller
+	// backs off. Instagram lifts these blocks on its own; continuing to poll
+	// through one only keeps it alive.
+	pollBackoffFactor = 2
+	maxPollInterval   = time.Hour
+)
 
 type instagramClient interface {
 	Profile(ctx context.Context, username string) (domain.User, error)
@@ -59,37 +71,60 @@ func New(insta instagramClient, repo mediaRepo, sender sender, targets []domain.
 	}
 }
 
-// Run polls until ctx is cancelled. A failed cycle is logged and retried on the
-// next tick rather than bringing the process down.
+// Run polls until ctx is cancelled. A failed cycle is logged and retried later
+// rather than bringing the process down.
+//
+// The interval is not fixed: polling on schedule through a throttle is what
+// keeps the throttle alive, so a rate-limited cycle backs the next one off and a
+// clean cycle restores the configured pace.
 func (p *Poller) Run(ctx context.Context) error {
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
-
-	p.cycle(ctx)
+	delay := p.interval
 
 	for {
+		throttled := p.cycle(ctx)
+
+		switch {
+		case throttled:
+			delay = min(delay*pollBackoffFactor, maxPollInterval)
+			log.Warn().Dur("next_poll_in", delay).Msg("instagram is throttling, backing off")
+		case delay != p.interval:
+			delay = p.interval
+			log.Info().Dur("next_poll_in", delay).Msg("throttling cleared, resuming the configured interval")
+		}
+
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("poller stopped")
 			return nil
-		case <-ticker.C:
-			p.cycle(ctx)
+		case <-time.After(delay):
 		}
 	}
 }
 
-func (p *Poller) cycle(ctx context.Context) {
+// cycle polls every target once, reporting whether Instagram throttled it.
+func (p *Poller) cycle(ctx context.Context) bool {
 	var blocked error
+	throttled := false
 
-	for _, target := range p.targets {
+	for i, target := range p.targets {
 		if ctx.Err() != nil {
-			return
+			return throttled
+		}
+
+		// Space the targets out. Firing every request back to back is what a
+		// scraper looks like; a few seconds between them costs nothing when the
+		// interval is minutes.
+		if i > 0 {
+			sleep(ctx, jitter(targetGap))
 		}
 
 		err := p.pollTarget(ctx, target)
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Msg("poll cycle failed for target")
 
+			if errors.Is(err, domain.ErrRateLimited) {
+				throttled = true
+			}
 			if blocked == nil && isBlockedErr(err) {
 				blocked = err
 			}
@@ -98,6 +133,16 @@ func (p *Poller) cycle(ctx context.Context) {
 
 	p.reportStall(ctx, blocked)
 	metrics.IncPollCycle()
+
+	return throttled
+}
+
+// jitter spreads a delay by up to a quarter either way, so repeated cycles do
+// not settle into a fixed, obviously mechanical rhythm.
+func jitter(d time.Duration) time.Duration {
+	spread := int64(d) / 2
+
+	return d - time.Duration(spread/2) + time.Duration(rand.Int64N(spread+1))
 }
 
 // reportStall tells the chat when Instagram stops answering, and again when it

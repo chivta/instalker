@@ -339,3 +339,51 @@ func TestProbe(t *testing.T) {
 		}
 	})
 }
+
+// Polling on schedule through a throttle is what keeps the throttle alive, so a
+// rate-limited cycle must report itself and a clean one must clear.
+func TestCycleReportsThrottling(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	insta := &fakeInsta{
+		postsErr:   fmt.Errorf("posts: %w", domain.ErrRateLimited),
+		storiesErr: fmt.Errorf("stories: %w", domain.ErrRateLimited),
+	}
+	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+
+	if !p.cycle(context.Background()) {
+		t.Fatal("a rate-limited cycle did not report throttling")
+	}
+
+	insta.postsErr, insta.storiesErr = nil, nil
+	if p.cycle(context.Background()) {
+		t.Fatal("a clean cycle still reported throttling")
+	}
+}
+
+// An auth failure is not a throttle: backing off would delay the recovery the
+// user is being asked to perform.
+func TestAuthFailureIsNotThrottling(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	insta := &fakeInsta{
+		postsErr:   fmt.Errorf("posts: %w", domain.ErrUnauthorized),
+		storiesErr: fmt.Errorf("stories: %w", domain.ErrUnauthorized),
+	}
+	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+
+	if p.cycle(context.Background()) {
+		t.Fatal("an auth failure was treated as throttling")
+	}
+}
+
+func TestJitterStaysNearTheBaseDelay(t *testing.T) {
+	const base = 8 * time.Second
+
+	for range 200 {
+		got := jitter(base)
+		if got < base*3/4 || got > base*5/4 {
+			t.Fatalf("jitter(%s) = %s, want within ±25%%", base, got)
+		}
+	}
+}
