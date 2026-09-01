@@ -160,3 +160,115 @@ func TestStateRepoSession(t *testing.T) {
 		t.Fatalf("session = %q after reopen, want it persisted", got)
 	}
 }
+
+func TestTargetRepo(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "targets.db")
+
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	repo := NewTargetRepo(db)
+
+	got, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list on an empty store: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d targets, want none", len(got))
+	}
+
+	err = repo.Save(ctx, []domain.User{
+		{PK: "1", Username: "alpha"},
+		{PK: "2", Username: "beta", IsPrivate: true},
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got, err = repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 2 || got[0].Username != "alpha" || got[1].PK != "2" || !got[1].IsPrivate {
+		t.Fatalf("round trip lost data: %+v", got)
+	}
+
+	// Saving again replaces rather than accumulating, so an account that is no
+	// longer watched stops being polled.
+	err = repo.Save(ctx, []domain.User{{PK: "3", Username: "gamma"}})
+	if err != nil {
+		t.Fatalf("re-save: %v", err)
+	}
+
+	got, err = repo.List(ctx)
+	if err != nil {
+		t.Fatalf("list after replace: %v", err)
+	}
+	if len(got) != 1 || got[0].Username != "gamma" {
+		t.Fatalf("got %+v, want only gamma", got)
+	}
+
+	// The whole point is surviving a restart.
+	db.Close()
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+
+	got, err = NewTargetRepo(db).List(ctx)
+	if err != nil {
+		t.Fatalf("list after reopen: %v", err)
+	}
+	if len(got) != 1 || got[0].Username != "gamma" {
+		t.Fatalf("targets did not survive a reopen: %+v", got)
+	}
+}
+
+// An existing deployment already knows its accounts' ids from watch_state, so
+// the cache starts populated rather than needing one more lookup to learn what
+// the database has recorded for weeks.
+func TestTargetCacheSeedsFromWatchState(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "seed.db")
+
+	// A database as it exists before the targets table was introduced.
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, `DELETE FROM targets`)
+	if err != nil {
+		t.Fatalf("clear targets: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM schema_version WHERE name = '003_targets.sql'`)
+	if err != nil {
+		t.Fatalf("rewind migration: %v", err)
+	}
+
+	err = NewMediaRepo(db).MarkInitialized(ctx, domain.User{PK: "6230019413", Username: "locroise"})
+	if err != nil {
+		t.Fatalf("seed watch state: %v", err)
+	}
+	db.Close()
+
+	// Re-running the migration should carry those accounts across.
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+
+	got, err := NewTargetRepo(db).List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 || got[0].PK != "6230019413" || got[0].Username != "locroise" {
+		t.Fatalf("cache was not seeded from watch_state: %+v", got)
+	}
+}

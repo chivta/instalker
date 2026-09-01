@@ -58,3 +58,31 @@ func (stubInsta) Posts(context.Context, domain.User) ([]domain.Media, error) { r
 func (stubInsta) Stories(context.Context, domain.User) ([]domain.Media, error) {
 	return nil, nil
 }
+
+func TestCovers(t *testing.T) {
+	cached := []domain.User{{Username: "locroise"}, {Username: "lem1rol"}}
+
+	tests := []struct {
+		name   string
+		cached []domain.User
+		wanted []string
+		want   bool
+	}{
+		{"everything wanted is remembered", cached, []string{"locroise", "lem1rol"}, true},
+		{"case does not matter", cached, []string{"LocRoise"}, true},
+		{"a newly added account is missing", cached, []string{"locroise", "someone-new"}, false},
+		{"nothing remembered", nil, []string{"locroise"}, false},
+		// No names means the accounts come from the following list, so whatever
+		// was remembered is what was being watched.
+		{"no names requested", cached, nil, true},
+		{"no names and nothing remembered", nil, nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := covers(tt.cached, tt.wanted); got != tt.want {
+				t.Errorf("covers(%v, %v) = %v, want %v", tt.cached, tt.wanted, got, tt.want)
+			}
+		})
+	}
+}

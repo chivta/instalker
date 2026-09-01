@@ -135,7 +135,9 @@ func run(cfg config.Config) error {
 		wanted = cfg.Targets
 	}
 
-	me, targets, err := awaitStartup(ctx, cfg, wanted, insta, sessions, telegram, &ready, sessionChanged)
+	targetCache := storage.NewTargetRepo(db)
+
+	me, targets, err := awaitStartup(ctx, cfg, wanted, insta, sessions, targetCache, telegram, &ready, sessionChanged)
 	if err != nil {
 		return err
 	}
@@ -175,6 +177,7 @@ func awaitStartup(
 	wanted []string,
 	insta *instagram.Client,
 	sessions *session.Manager,
+	cache *storage.TargetRepo,
 	telegram *notifier.Telegram,
 	ready *readiness,
 	sessionChanged <-chan struct{},
@@ -182,7 +185,7 @@ func awaitStartup(
 	notified := false
 
 	for {
-		me, targets, err := tryStartup(ctx, cfg, wanted, insta, sessions, ready)
+		me, targets, err := tryStartup(ctx, cfg, wanted, insta, sessions, cache, ready)
 		if err == nil {
 			return me, targets, nil
 		}
@@ -221,6 +224,7 @@ func tryStartup(
 	wanted []string,
 	insta *instagram.Client,
 	sessions *session.Manager,
+	cache *storage.TargetRepo,
 	ready *readiness,
 ) (domain.User, []domain.User, error) {
 	me, err := authenticate(ctx, cfg, insta, sessions)
@@ -228,10 +232,23 @@ func tryStartup(
 		return domain.User{}, nil, err
 	}
 
+	cached, err := cache.List(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to read remembered targets")
+	}
+
+	// Resolving is a network call per account, and the answer rarely changes.
+	// With a usable cache there is no point spending the full retry budget on
+	// it: fail fast and fall back.
+	attempts := authRetryAttempts
+	if covers(cached, wanted) {
+		attempts = 1
+	}
+
 	// This is the first call that actually exercises the session, so it is the
 	// one that gets the retry budget.
 	var targets []domain.User
-	err = withBackoff(ctx, "resolve targets", func() error {
+	err = withBackoff(ctx, "resolve targets", attempts, func() error {
 		var resolveErr error
 		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, wanted)
 		// Each attempt updates what /ping reports, so a session pasted during
@@ -240,10 +257,51 @@ func tryStartup(
 		return resolveErr
 	})
 	if err != nil {
-		return domain.User{}, nil, err
+		// A throttled lookup must not stop the bot from starting when it
+		// already knows these accounts. Anything else — a rejected session, a
+		// challenge — is still fatal, because the cache cannot fix it.
+		if !errors.Is(err, domain.ErrRateLimited) || !covers(cached, wanted) {
+			return domain.User{}, nil, err
+		}
+
+		log.Warn().Err(err).Int("targets", len(cached)).Msg("using remembered targets, resolution is throttled")
+
+		return me, cached, nil
+	}
+
+	err = cache.Save(ctx, targets)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to remember the resolved targets")
 	}
 
 	return me, targets, nil
+}
+
+// covers reports whether the cache holds every account that was asked for. An
+// empty request means the accounts came from the following list, in which case
+// anything remembered will do.
+func covers(cached []domain.User, wanted []string) bool {
+	if len(cached) == 0 {
+		return false
+	}
+	if len(wanted) == 0 {
+		return true
+	}
+
+	for _, username := range wanted {
+		found := false
+		for _, target := range cached {
+			if strings.EqualFold(target.Username, username) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
 }
 
 // authenticate puts a session on the client: the stored one when there is one,
@@ -284,7 +342,7 @@ func authenticate(ctx context.Context, cfg config.Config, insta *instagram.Clien
 // withBackoff retries an operation that failed for a transient reason.
 // Instagram throttles by source address, and a pod that exits on the first 429
 // is restarted straight into another request, which deepens the block.
-func withBackoff(ctx context.Context, what string, op func() error) error {
+func withBackoff(ctx context.Context, what string, attempts int, op func() error) error {
 	delay := authRetryDelay
 
 	for attempt := 1; ; attempt++ {
@@ -294,7 +352,7 @@ func withBackoff(ctx context.Context, what string, op func() error) error {
 		}
 
 		transient := errors.Is(err, domain.ErrRateLimited) || errors.Is(err, domain.ErrBadResponse)
-		if !transient || attempt == authRetryAttempts {
+		if !transient || attempt >= attempts {
 			return err
 		}
 

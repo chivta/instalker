@@ -25,6 +25,10 @@ Who is watched, and how often, comes from `internal/schedule/schedule.toml`.
 When it lists no accounts, `TARGETS` is used, and failing that the accounts the
 logged-in user **follows**.
 
+Resolved accounts are remembered in the database. Looking a username up costs a
+request, and a throttled lookup used to stop the bot from starting at all — so
+when Instagram is rate limiting, it starts from what it already knows instead.
+
 The first cycle for a target only records a baseline — existing posts and live
 stories are marked as seen without being sent, so starting the bot does not dump
 history into the chat. Everything after that is forwarded.
