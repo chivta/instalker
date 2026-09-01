@@ -9,6 +9,7 @@ import (
 
 	"github.com/arvlas/instalker/internal/domain"
 	"github.com/arvlas/instalker/internal/poller"
+	"github.com/arvlas/instalker/internal/schedule"
 )
 
 func TestReadinessBeforeStartupFinishes(t *testing.T) {
@@ -34,7 +35,7 @@ func TestReadinessOncePolling(t *testing.T) {
 	var ready readiness
 	ready.stalled(domain.ErrRateLimited)
 
-	watcher := poller.New(&stubInsta{}, nil, nil, nil, time.Minute)
+	watcher := poller.New(&stubInsta{}, nil, nil, nil, schedule.Always(time.Minute, time.Minute))
 	ready.polling(watcher)
 
 	probe, err := ready.probe(context.Background())

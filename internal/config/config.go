@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/go-playground/validator/v10"
@@ -28,10 +27,9 @@ type Config struct {
 	// accounts the logged-in user follows.
 	Targets []string `env:"TARGETS" envSeparator:","`
 
-	PollInterval time.Duration `env:"POLL_INTERVAL" validate:"required,min=1m"`
-	DBPath       string        `env:"DB_PATH"       validate:"required"`
-	HTTPAddr     string        `env:"HTTP_ADDR"     validate:"required"`
-	LogLevel     string        `env:"LOG_LEVEL"     validate:"required,oneof=debug info warn error"`
+	DBPath   string `env:"DB_PATH"   validate:"required"`
+	HTTPAddr string `env:"HTTP_ADDR" validate:"required"`
+	LogLevel string `env:"LOG_LEVEL"     validate:"required,oneof=debug info warn error"`
 }
 
 // Load reads .env when present, overlays the process environment and validates
@@ -40,10 +38,9 @@ func Load() (Config, error) {
 	_ = godotenv.Load()
 
 	cfg := Config{
-		PollInterval: 5 * time.Minute,
-		DBPath:       "data/instalker.db",
-		HTTPAddr:     ":8080",
-		LogLevel:     "info",
+		DBPath:   "data/instalker.db",
+		HTTPAddr: ":8080",
+		LogLevel: "info",
 	}
 
 	err := env.Parse(&cfg)

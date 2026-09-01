@@ -162,7 +162,6 @@ func startBot(t *testing.T, chat int64) (*tgfake.Server, string) {
 		// The bot must reach the fake instead of Telegram.
 		"TELEGRAM_API_URL": fake.URL(),
 		"HTTP_ADDR":        "127.0.0.1:0",
-		"POLL_INTERVAL":    "1m",
 		"LOG_LEVEL":        "info",
 	})
 	if err != nil {

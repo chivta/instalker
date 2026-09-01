@@ -16,12 +16,14 @@ poller ──▶ instagram (web private API)
 - `internal/domain` — types and sentinel errors, no dependencies
 - `internal/instagram` — Instagram web private API client
 - `internal/poller` — business logic: resolve targets, diff, deliver
+- `internal/schedule` — when each account is checked, embedded as TOML
 - `internal/storage` — SQLite state, migrations embedded and applied on startup
 - `internal/notifier` — Telegram delivery
 - `internal/health`, `internal/metrics`, `internal/logging`, `internal/config`
 
-Targets come from `TARGETS`; when it is empty, the accounts the logged-in user
-**follows** are watched instead.
+Who is watched, and how often, comes from `internal/schedule/schedule.toml`.
+When it lists no accounts, `TARGETS` is used, and failing that the accounts the
+logged-in user **follows**.
 
 The first cycle for a target only records a baseline — existing posts and live
 stories are marked as seen without being sent, so starting the bot does not dump
@@ -74,15 +76,38 @@ go test ./test/offline/ -v
 Copy `.example.env` to `.env` and fill it in. Every variable is documented there.
 The process exits immediately if anything required is missing or invalid.
 
-## Running
+### Schedule
 
-```sh
-go run ./cmd/instalker          # local
-docker compose up               # local, hot reload via air
-docker build --target production -t instalker .
+When each account is checked lives in `internal/schedule/schedule.toml`, which is
+compiled into the binary:
+
+```toml
+timezone = "Europe/Kyiv"
+
+[window]
+from = "10:00"
+to = "01:00"
+
+[defaults]
+posts = "1h"
+stories = "1h"
+
+[[accounts]]
+username = "locroise"
+stories = "30m"
 ```
 
-`GET /health` returns 204, `GET /metrics` exposes counters in Prometheus format.
+Nothing is polled outside the window, which may cross midnight. Each account
+takes the defaults unless it overrides them, and `"0"` switches a feed off.
+The accounts listed here are also *who* gets watched; `TARGETS` and the
+following list are only fallbacks when the file names none.
+
+Changing the schedule means editing that file and rebuilding — no secret to
+re-encrypt, no manifest to touch. `SCHEDULE_PATH` loads a file from disk instead,
+which is how a ConfigMap or a local experiment overrides it without a rebuild.
+
+The timezone database is compiled in (`time/tzdata`), so the minimal container
+image resolves `Europe/Kyiv` without needing a `tzdata` package.
 
 ## Deploying
 

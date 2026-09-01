@@ -9,6 +9,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// The schedule names a timezone, and a minimal container image carries no
+	// zone database. Embedding it keeps the bot from dying on a missing file.
+	_ "time/tzdata"
 
 	"github.com/rs/zerolog/log"
 
@@ -20,6 +23,7 @@ import (
 	"github.com/arvlas/instalker/internal/metrics"
 	"github.com/arvlas/instalker/internal/notifier"
 	"github.com/arvlas/instalker/internal/poller"
+	"github.com/arvlas/instalker/internal/schedule"
 	"github.com/arvlas/instalker/internal/session"
 	"github.com/arvlas/instalker/internal/storage"
 )
@@ -54,6 +58,13 @@ func main() {
 func run(cfg config.Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Loaded first: a broken schedule is a startup error, not something to
+	// discover hours later when a feed silently never runs.
+	plan, err := schedule.Load()
+	if err != nil {
+		return err
+	}
 
 	db, err := storage.Open(ctx, cfg.DBPath)
 	if err != nil {
@@ -119,7 +130,12 @@ func run(cfg config.Config) error {
 		<-commandErr
 	}()
 
-	me, targets, err := awaitStartup(ctx, cfg, insta, sessions, telegram, &ready, sessionChanged)
+	wanted := plan.Usernames()
+	if len(wanted) == 0 {
+		wanted = cfg.Targets
+	}
+
+	me, targets, err := awaitStartup(ctx, cfg, wanted, insta, sessions, telegram, &ready, sessionChanged)
 	if err != nil {
 		return err
 	}
@@ -130,10 +146,11 @@ func run(cfg config.Config) error {
 	}
 
 	repo := storage.NewMediaRepo(db)
-	watcher := poller.New(insta, repo, telegram, targets, cfg.PollInterval)
+	watcher := poller.New(insta, repo, telegram, targets, plan)
 	ready.polling(watcher)
 
-	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> every %s", strings.Join(usernames(targets), "</b>, <b>"), cfg.PollInterval))
+	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> during %s",
+		strings.Join(usernames(targets), "</b>, <b>"), plan.Window()))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to send startup notice")
 	}
@@ -155,6 +172,7 @@ func run(cfg config.Config) error {
 func awaitStartup(
 	ctx context.Context,
 	cfg config.Config,
+	wanted []string,
 	insta *instagram.Client,
 	sessions *session.Manager,
 	telegram *notifier.Telegram,
@@ -164,7 +182,7 @@ func awaitStartup(
 	notified := false
 
 	for {
-		me, targets, err := tryStartup(ctx, cfg, insta, sessions, ready)
+		me, targets, err := tryStartup(ctx, cfg, wanted, insta, sessions, ready)
 		if err == nil {
 			return me, targets, nil
 		}
@@ -200,6 +218,7 @@ func awaitStartup(
 func tryStartup(
 	ctx context.Context,
 	cfg config.Config,
+	wanted []string,
 	insta *instagram.Client,
 	sessions *session.Manager,
 	ready *readiness,
@@ -214,7 +233,7 @@ func tryStartup(
 	var targets []domain.User
 	err = withBackoff(ctx, "resolve targets", func() error {
 		var resolveErr error
-		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, cfg.Targets)
+		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, wanted)
 		// Each attempt updates what /ping reports, so a session pasted during
 		// the retry window is reflected on the next answer.
 		ready.stalled(resolveErr)

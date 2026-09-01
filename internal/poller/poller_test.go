@@ -9,7 +9,11 @@ import (
 	"time"
 
 	"github.com/arvlas/instalker/internal/domain"
+	"github.com/arvlas/instalker/internal/schedule"
 )
+
+// bothFeeds is what a caller passes when it wants a full poll of a target.
+var bothFeeds = []domain.Kind{domain.KindPost, domain.KindStory}
 
 type fakeInsta struct {
 	posts        []domain.Media
@@ -126,14 +130,14 @@ func TestPollTarget(t *testing.T) {
 
 			repo := &fakeRepo{seen: seen, initialized: tt.initialized}
 			sender := &fakeSender{}
-			p := New(&fakeInsta{posts: tt.posts, stories: tt.stories}, repo, sender, []domain.User{owner}, time.Minute)
+			p := New(&fakeInsta{posts: tt.posts, stories: tt.stories}, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 			// A cancelled context still runs the cycle body; it only skips the
 			// inter-send delay, which keeps the test fast.
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
-			err := p.pollTarget(ctx, owner)
+			err := p.pollTarget(ctx, owner, bothFeeds, time.Now())
 			if err != nil {
 				t.Fatalf("pollTarget: %v", err)
 			}
@@ -155,19 +159,19 @@ func TestPollTargetMarksSeenAfterBaseline(t *testing.T) {
 	repo := &fakeRepo{seen: map[string]bool{}}
 	sender := &fakeSender{}
 	insta := &fakeInsta{posts: []domain.Media{media("p1", domain.KindPost, owner)}}
-	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := p.pollTarget(ctx, owner)
+	err := p.pollTarget(ctx, owner, bothFeeds, time.Now())
 	if err != nil {
 		t.Fatalf("baseline cycle: %v", err)
 	}
 
 	insta.posts = append([]domain.Media{media("p2", domain.KindPost, owner)}, insta.posts...)
 
-	err = p.pollTarget(ctx, owner)
+	err = p.pollTarget(ctx, owner, bothFeeds, time.Now())
 	if err != nil {
 		t.Fatalf("second cycle: %v", err)
 	}
@@ -194,15 +198,15 @@ func TestAuthFailureAlertsOnceAndRecovers(t *testing.T) {
 		postsErr:   fmt.Errorf("posts target: %w", domain.ErrUnauthorized),
 		storiesErr: fmt.Errorf("stories target: %w", domain.ErrUnauthorized),
 	}
-	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 	// cycle short-circuits on a cancelled context, so this one must stay live.
 	// No media is delivered in either phase, so there is no send delay to wait on.
 	ctx := context.Background()
 
 	// Two broken cycles must produce exactly one alert, not one per tick.
-	p.cycle(ctx)
-	p.cycle(ctx)
+	p.tick(ctx, time.Now())
+	p.tick(ctx, time.Now())
 
 	if len(sender.notices) != 1 {
 		t.Fatalf("got %d notices, want 1: %v", len(sender.notices), sender.notices)
@@ -213,8 +217,8 @@ func TestAuthFailureAlertsOnceAndRecovers(t *testing.T) {
 
 	// Recovery is announced once.
 	insta.postsErr, insta.storiesErr = nil, nil
-	p.cycle(ctx)
-	p.cycle(ctx)
+	p.tick(ctx, time.Now())
+	p.tick(ctx, time.Now())
 
 	if len(sender.notices) != 2 {
 		t.Fatalf("got %d notices after recovery, want 2: %v", len(sender.notices), sender.notices)
@@ -232,12 +236,12 @@ func TestPartialFetchDoesNotBaseline(t *testing.T) {
 		posts:      []domain.Media{media("p1", domain.KindPost, owner)},
 		storiesErr: fmt.Errorf("stories target: %w", domain.ErrUnauthorized),
 	}
-	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_ = p.pollTarget(ctx, owner)
+	_ = p.pollTarget(ctx, owner, bothFeeds, time.Now())
 
 	if repo.initialized {
 		t.Fatal("target was baselined despite a failed feed")
@@ -252,9 +256,9 @@ func TestRateLimitAlertDoesNotAskForNewSession(t *testing.T) {
 		postsErr:   fmt.Errorf("posts target: %w", domain.ErrRateLimited),
 		storiesErr: fmt.Errorf("stories target: %w", domain.ErrRateLimited),
 	}
-	p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
-	p.cycle(context.Background())
+	p.tick(context.Background(), time.Now())
 
 	if len(sender.notices) != 1 {
 		t.Fatalf("got %d notices, want 1", len(sender.notices))
@@ -293,7 +297,7 @@ func TestProbe(t *testing.T) {
 	t.Run("reports counts and newest timestamp across both feeds", func(t *testing.T) {
 		insta := &fakeInsta{posts: []domain.Media{older}, stories: []domain.Media{newer}}
 		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
-		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 		got := p.Probe(context.Background())
 
@@ -311,7 +315,7 @@ func TestProbe(t *testing.T) {
 	t.Run("surfaces a feed failure", func(t *testing.T) {
 		insta := &fakeInsta{postsErr: fmt.Errorf("posts: %w", domain.ErrRateLimited)}
 		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
-		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+		p := New(insta, repo, &fakeSender{}, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 		got := p.Probe(context.Background())
 
@@ -327,7 +331,7 @@ func TestProbe(t *testing.T) {
 		insta := &fakeInsta{posts: []domain.Media{older}, stories: []domain.Media{newer}}
 		repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
 		sender := &fakeSender{}
-		p := New(insta, repo, sender, []domain.User{owner}, time.Minute)
+		p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
 		p.Probe(context.Background())
 
@@ -349,15 +353,22 @@ func TestCycleReportsThrottling(t *testing.T) {
 		postsErr:   fmt.Errorf("posts: %w", domain.ErrRateLimited),
 		storiesErr: fmt.Errorf("stories: %w", domain.ErrRateLimited),
 	}
-	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
-	if !p.cycle(context.Background()) {
-		t.Fatal("a rate-limited cycle did not report throttling")
+	now := time.Now()
+	p.tick(context.Background(), now)
+	if !p.backoffUntil.After(now) {
+		t.Fatal("a rate-limited tick did not pause polling")
 	}
 
+	// Clear the pause so the next tick runs, then check it is not re-armed.
 	insta.postsErr, insta.storiesErr = nil, nil
-	if p.cycle(context.Background()) {
-		t.Fatal("a clean cycle still reported throttling")
+	p.backoffUntil = time.Time{}
+
+	now = time.Now()
+	p.tick(context.Background(), now)
+	if p.backoffUntil.After(now) {
+		t.Fatal("a clean tick still paused polling")
 	}
 }
 
@@ -370,10 +381,13 @@ func TestAuthFailureIsNotThrottling(t *testing.T) {
 		postsErr:   fmt.Errorf("posts: %w", domain.ErrUnauthorized),
 		storiesErr: fmt.Errorf("stories: %w", domain.ErrUnauthorized),
 	}
-	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, time.Minute)
+	p := New(insta, repo, &fakeSender{}, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
 
-	if p.cycle(context.Background()) {
-		t.Fatal("an auth failure was treated as throttling")
+	now := time.Now()
+	p.tick(context.Background(), now)
+
+	if p.backoffUntil.After(now) {
+		t.Fatal("an auth failure paused polling, delaying the /session recovery it asks for")
 	}
 }
 
@@ -385,5 +399,71 @@ func TestJitterStaysNearTheBaseDelay(t *testing.T) {
 		if got < base*3/4 || got > base*5/4 {
 			t.Fatalf("jitter(%s) = %s, want within ±25%%", base, got)
 		}
+	}
+}
+
+// The schedule's whole point is that feeds run at different cadences, so a due
+// check that ignores either the interval or the window would go unnoticed.
+func TestDueRespectsIntervalsAndWindow(t *testing.T) {
+	plan, err := schedule.Load()
+	if err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+
+	locroise := domain.User{PK: "1", Username: "locroise"}
+	lem1rol := domain.User{PK: "2", Username: "lem1rol"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	p := New(&fakeInsta{}, repo, &fakeSender{}, []domain.User{locroise, lem1rol}, plan)
+
+	ctx := context.Background()
+	start := time.Date(2026, 8, 13, 12, 0, 0, 0, plan.Location)
+
+	// Nothing has run yet, so both feeds are due for both accounts.
+	if got := p.due(ctx, locroise, start); len(got) != 2 {
+		t.Fatalf("first poll due = %v, want both feeds", got)
+	}
+
+	p.markFetched(locroise.PK, domain.KindPost, start)
+	p.markFetched(locroise.PK, domain.KindStory, start)
+	p.markFetched(lem1rol.PK, domain.KindPost, start)
+	p.markFetched(lem1rol.PK, domain.KindStory, start)
+
+	// Half an hour on: only locroise's stories are configured that often.
+	half := start.Add(30 * time.Minute)
+	if got := p.due(ctx, locroise, half); len(got) != 1 || got[0] != domain.KindStory {
+		t.Errorf("locroise at +30m = %v, want stories only", got)
+	}
+	if got := p.due(ctx, lem1rol, half); len(got) != 0 {
+		t.Errorf("lem1rol at +30m = %v, want nothing", got)
+	}
+
+	// An hour on, everything is due again.
+	hour := start.Add(time.Hour)
+	if got := p.due(ctx, lem1rol, hour); len(got) != 2 {
+		t.Errorf("lem1rol at +1h = %v, want both feeds", got)
+	}
+}
+
+// Outside the window nothing is fetched at all, however overdue it looks.
+func TestTickSkipsOutsideTheWindow(t *testing.T) {
+	plan, err := schedule.Load()
+	if err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+
+	owner := domain.User{PK: "1", Username: "locroise"}
+	insta := &fakeInsta{posts: []domain.Media{media("p1", domain.KindPost, owner)}}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	p := New(insta, repo, sender, []domain.User{owner}, plan)
+
+	// 04:00 is outside the configured 10:00–01:00 window.
+	p.tick(context.Background(), time.Date(2026, 8, 13, 4, 0, 0, 0, plan.Location))
+
+	if len(sender.sent) != 0 {
+		t.Errorf("delivered %d media outside the window, want 0", len(sender.sent))
+	}
+	if len(p.lastPosts) != 0 {
+		t.Error("a feed was fetched outside the window")
 	}
 }

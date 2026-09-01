@@ -11,6 +11,7 @@ import (
 
 	"github.com/arvlas/instalker/internal/domain"
 	"github.com/arvlas/instalker/internal/metrics"
+	"github.com/arvlas/instalker/internal/schedule"
 )
 
 const (
@@ -21,11 +22,16 @@ const (
 	// targetGap spaces out the accounts within one cycle.
 	targetGap = 5 * time.Second
 
-	// pollBackoffFactor and maxPollInterval bound how far a throttled poller
-	// backs off. Instagram lifts these blocks on its own; continuing to poll
+	// tickInterval is how often the loop asks the schedule what is due. It only
+	// needs to be finer than the shortest interval anyone configures.
+	tickInterval = time.Minute
+
+	// pollBackoffFactor, minBackoff and maxBackoff bound how long a throttled
+	// poller pauses. Instagram lifts these blocks on its own; continuing to poll
 	// through one only keeps it alive.
 	pollBackoffFactor = 2
-	maxPollInterval   = time.Hour
+	minBackoff        = 10 * time.Minute
+	maxBackoff        = time.Hour
 )
 
 type instagramClient interface {
@@ -47,80 +53,101 @@ type sender interface {
 	Notify(ctx context.Context, text string) error
 }
 
-// Poller watches a fixed set of Instagram accounts and forwards anything new.
+// Poller watches a set of Instagram accounts and forwards anything new, at the
+// cadence the schedule defines.
 type Poller struct {
-	insta    instagramClient
-	repo     mediaRepo
-	sender   sender
-	targets  []domain.User
-	interval time.Duration
+	insta  instagramClient
+	repo   mediaRepo
+	sender sender
 
-	// authAlerted keeps a broken session from re-alerting on every tick. It is
-	// only touched from the single goroutine running Run.
-	authAlerted bool
+	targets []domain.User
+	plan    *schedule.Plan
+
+	// Everything below is touched only by the single goroutine running Run.
+	lastPosts    map[string]time.Time
+	lastStories  map[string]time.Time
+	backoff      time.Duration
+	backoffUntil time.Time
+	awake        bool
+	authAlerted  bool
 }
 
 // New builds a poller over an already resolved set of targets.
-func New(insta instagramClient, repo mediaRepo, sender sender, targets []domain.User, interval time.Duration) *Poller {
+func New(insta instagramClient, repo mediaRepo, sender sender, targets []domain.User, plan *schedule.Plan) *Poller {
 	return &Poller{
-		insta:    insta,
-		repo:     repo,
-		sender:   sender,
-		targets:  targets,
-		interval: interval,
+		insta:       insta,
+		repo:        repo,
+		sender:      sender,
+		targets:     targets,
+		plan:        plan,
+		lastPosts:   map[string]time.Time{},
+		lastStories: map[string]time.Time{},
 	}
 }
 
-// Run polls until ctx is cancelled. A failed cycle is logged and retried later
-// rather than bringing the process down.
+// Run polls until ctx is cancelled. A failed fetch is logged and retried on a
+// later tick rather than bringing the process down.
 //
-// The interval is not fixed: polling on schedule through a throttle is what
-// keeps the throttle alive, so a rate-limited cycle backs the next one off and a
-// clean cycle restores the configured pace.
+// The loop wakes often and asks the schedule what is due, rather than sleeping
+// for a fixed interval: feeds run at different cadences per account, and only
+// inside the configured window.
 func (p *Poller) Run(ctx context.Context) error {
-	delay := p.interval
+	log.Info().Str("window", p.plan.Window()).Msg("polling on schedule")
 
 	for {
-		throttled := p.cycle(ctx)
-
-		switch {
-		case throttled:
-			delay = min(delay*pollBackoffFactor, maxPollInterval)
-			log.Warn().Dur("next_poll_in", delay).Msg("instagram is throttling, backing off")
-		case delay != p.interval:
-			delay = p.interval
-			log.Info().Dur("next_poll_in", delay).Msg("throttling cleared, resuming the configured interval")
-		}
+		p.tick(ctx, time.Now())
 
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("poller stopped")
 			return nil
-		case <-time.After(delay):
+		case <-time.After(tickInterval):
 		}
 	}
 }
 
-// cycle polls every target once, reporting whether Instagram throttled it.
-func (p *Poller) cycle(ctx context.Context) bool {
+// tick polls whatever is due at now.
+func (p *Poller) tick(ctx context.Context, now time.Time) {
+	if now.Before(p.backoffUntil) {
+		return
+	}
+
+	if !p.plan.Active(now) {
+		if p.awake {
+			p.awake = false
+			log.Info().Str("window", p.plan.Window()).Msg("outside the polling window, sleeping")
+		}
+		return
+	}
+	if !p.awake {
+		p.awake = true
+		log.Info().Msg("inside the polling window, polling resumed")
+	}
+
 	var blocked error
 	throttled := false
+	polled := 0
 
-	for i, target := range p.targets {
+	for _, target := range p.targets {
 		if ctx.Err() != nil {
-			return throttled
+			return
 		}
 
-		// Space the targets out. Firing every request back to back is what a
-		// scraper looks like; a few seconds between them costs nothing when the
-		// interval is minutes.
-		if i > 0 {
+		due := p.due(ctx, target, now)
+		if len(due) == 0 {
+			continue
+		}
+
+		// Space the accounts out. Firing every request back to back is what a
+		// scraper looks like; a few seconds costs nothing at these intervals.
+		if polled > 0 {
 			sleep(ctx, jitter(targetGap))
 		}
+		polled++
 
-		err := p.pollTarget(ctx, target)
+		err := p.pollTarget(ctx, target, due, now)
 		if err != nil {
-			log.Error().Err(err).Str("target", target.Username).Msg("poll cycle failed for target")
+			log.Error().Err(err).Str("target", target.Username).Msg("poll failed for target")
 
 			if errors.Is(err, domain.ErrRateLimited) {
 				throttled = true
@@ -131,10 +158,64 @@ func (p *Poller) cycle(ctx context.Context) bool {
 		}
 	}
 
+	if polled == 0 {
+		return
+	}
+
+	// Polling on schedule through a throttle is what keeps the throttle alive.
+	if throttled {
+		p.backoff = min(max(p.backoff*pollBackoffFactor, minBackoff), maxBackoff)
+		p.backoffUntil = now.Add(p.backoff)
+		log.Warn().Dur("paused_for", p.backoff).Msg("instagram is throttling, pausing polling")
+	} else if p.backoff != 0 {
+		p.backoff = 0
+		log.Info().Msg("throttling cleared, back on schedule")
+	}
+
 	p.reportStall(ctx, blocked)
 	metrics.IncPollCycle()
+}
 
-	return throttled
+// due reports which feeds of a target should be fetched now.
+//
+// A target that has never been baselined gets both feeds regardless of
+// schedule: the baseline marks what is already visible as seen, and doing that
+// one feed at a time would let the other arrive later as a flood of "new" media.
+func (p *Poller) due(ctx context.Context, target domain.User, now time.Time) []domain.Kind {
+	initialized, err := p.repo.Initialized(ctx, target.PK)
+	if err != nil {
+		log.Error().Err(err).Str("target", target.Username).Msg("failed to read watch state")
+		return nil
+	}
+	if !initialized {
+		return []domain.Kind{domain.KindPost, domain.KindStory}
+	}
+
+	account, found := p.plan.For(target.Username)
+	if !found {
+		// Not named in the schedule: fall back to the defaults it defines.
+		account = schedule.Account{Posts: p.plan.Defaults().Posts, Stories: p.plan.Defaults().Stories}
+	}
+
+	var due []domain.Kind
+	if isDue(p.lastPosts[target.PK], account.Posts, now) {
+		due = append(due, domain.KindPost)
+	}
+	if isDue(p.lastStories[target.PK], account.Stories, now) {
+		due = append(due, domain.KindStory)
+	}
+
+	return due
+}
+
+// isDue reports whether a feed with the given interval should run. A zero
+// interval means the feed is switched off.
+func isDue(last time.Time, every time.Duration, now time.Time) bool {
+	if every == 0 {
+		return false
+	}
+
+	return last.IsZero() || !now.Before(last.Add(every))
 }
 
 // jitter spreads a delay by up to a quarter either way, so repeated cycles do
@@ -179,28 +260,36 @@ func isBlockedErr(err error) bool {
 	return isAuthErr(err) || errors.Is(err, domain.ErrRateLimited)
 }
 
-func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
+func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domain.Kind, now time.Time) error {
 	initialized, err := p.repo.Initialized(ctx, target.PK)
 	if err != nil {
 		return err
 	}
 
-	posts, postsErr := p.insta.Posts(ctx, target)
-	if postsErr != nil {
-		log.Error().Err(postsErr).Str("target", target.Username).Msg("failed to fetch posts")
+	var (
+		media    []domain.Media
+		failures []error
+	)
+
+	for _, kind := range due {
+		fetched, err := p.fetch(ctx, target, kind)
+		if err != nil {
+			log.Error().Err(err).Str("target", target.Username).Str("kind", string(kind)).Msg("failed to fetch feed")
+			failures = append(failures, err)
+			continue
+		}
+
+		// Only a successful fetch advances the clock, so a failed one is retried
+		// on the next tick rather than waiting out the whole interval.
+		p.markFetched(target.PK, kind, now)
+
+		// Instagram returns newest first; deliver in chronological order.
+		media = append(media, reverse(fetched)...)
 	}
 
-	stories, storiesErr := p.insta.Stories(ctx, target)
-	if storiesErr != nil {
-		log.Error().Err(storiesErr).Str("target", target.Username).Msg("failed to fetch stories")
+	if len(failures) == len(due) {
+		return fmt.Errorf("every due feed failed: %w", errors.Join(failures...))
 	}
-
-	if postsErr != nil && storiesErr != nil {
-		return fmt.Errorf("both feeds failed: %w", errors.Join(postsErr, storiesErr))
-	}
-
-	// Instagram returns newest first; deliver in chronological order.
-	media := append(reverse(posts), reverse(stories)...)
 
 	fresh := 0
 	for _, m := range media {
@@ -213,8 +302,8 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 		}
 		fresh++
 
-		// The first cycle only establishes a baseline, otherwise starting the
-		// bot would replay the entire visible history into the chat.
+		// The first pass only establishes a baseline, otherwise starting the bot
+		// would replay the entire visible history into the chat.
 		if initialized {
 			err = p.sender.Send(ctx, m)
 			if err != nil {
@@ -234,7 +323,7 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 
 	// Baselining off a half-fetched target would mark only what was reachable as
 	// seen, and the missing feed would later arrive as a flood of "new" media.
-	if !initialized && postsErr == nil && storiesErr == nil {
+	if !initialized && len(failures) == 0 {
 		err = p.repo.MarkInitialized(ctx, target)
 		if err != nil {
 			return err
@@ -242,13 +331,32 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User) error {
 		log.Info().Str("target", target.Username).Int("baselined", fresh).Msg("baseline established, future media will be forwarded")
 	}
 
-	// One failed feed is still worth returning when Instagram is the reason:
-	// that means the session or the host is blocked, not that the feed is empty.
-	if isBlockedErr(postsErr) || isBlockedErr(storiesErr) {
-		return errors.Join(postsErr, storiesErr)
+	// A failed feed is still worth returning when Instagram is the reason: that
+	// means the session or the host is blocked, not that the feed was empty.
+	for _, failure := range failures {
+		if isBlockedErr(failure) {
+			return errors.Join(failures...)
+		}
 	}
 
 	return nil
+}
+
+func (p *Poller) fetch(ctx context.Context, target domain.User, kind domain.Kind) ([]domain.Media, error) {
+	if kind == domain.KindStory {
+		return p.insta.Stories(ctx, target)
+	}
+
+	return p.insta.Posts(ctx, target)
+}
+
+func (p *Poller) markFetched(pk string, kind domain.Kind, now time.Time) {
+	if kind == domain.KindStory {
+		p.lastStories[pk] = now
+		return
+	}
+
+	p.lastPosts[pk] = now
 }
 
 func isAuthErr(err error) bool {
