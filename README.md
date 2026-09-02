@@ -201,6 +201,10 @@ expires the bot reports it in the chat and the four steps above are repeated.
   a single dedupe table, and a one-binary deploy with no database server is worth
   more here than the shared convention.
 - Stories expire after 24 hours — keep `POLL_INTERVAL` well below that.
+- Throttling is **per endpoint**, not per host. Instagram has blocked the
+  timeline feed and profile lookups while serving stories normally, so each feed
+  backs off on its own — pausing everything would discard a working one, and
+  stories are gone within a day.
 - Instagram reports throttling as a **401 with `"Please wait a few minutes"`**,
   not only as a 429. The client classifies on that message rather than the status
   code, because reading it as a dead session leads to a password login and a

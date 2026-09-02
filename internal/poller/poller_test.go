@@ -357,18 +357,20 @@ func TestCycleReportsThrottling(t *testing.T) {
 
 	now := time.Now()
 	p.tick(context.Background(), now)
-	if !p.backoffUntil.After(now) {
-		t.Fatal("a rate-limited tick did not pause polling")
+
+	if !p.feed(owner.PK, domain.KindPost).pausedUntil.After(now) {
+		t.Fatal("a rate-limited feed was not paused")
 	}
 
 	// Clear the pause so the next tick runs, then check it is not re-armed.
 	insta.postsErr, insta.storiesErr = nil, nil
-	p.backoffUntil = time.Time{}
+	p.feed(owner.PK, domain.KindPost).pausedUntil = time.Time{}
+	p.feed(owner.PK, domain.KindStory).pausedUntil = time.Time{}
 
 	now = time.Now()
 	p.tick(context.Background(), now)
-	if p.backoffUntil.After(now) {
-		t.Fatal("a clean tick still paused polling")
+	if p.feed(owner.PK, domain.KindPost).pausedUntil.After(now) {
+		t.Fatal("a clean fetch still paused the feed")
 	}
 }
 
@@ -386,8 +388,8 @@ func TestAuthFailureIsNotThrottling(t *testing.T) {
 	now := time.Now()
 	p.tick(context.Background(), now)
 
-	if p.backoffUntil.After(now) {
-		t.Fatal("an auth failure paused polling, delaying the /session recovery it asks for")
+	if p.feed(owner.PK, domain.KindPost).pausedUntil.After(now) {
+		t.Fatal("an auth failure paused the feed, delaying the /session recovery it asks for")
 	}
 }
 
@@ -463,7 +465,42 @@ func TestTickSkipsOutsideTheWindow(t *testing.T) {
 	if len(sender.sent) != 0 {
 		t.Errorf("delivered %d media outside the window, want 0", len(sender.sent))
 	}
-	if len(p.lastPosts) != 0 {
+	if len(p.feeds) != 0 {
 		t.Error("a feed was fetched outside the window")
+	}
+}
+
+// Instagram throttles per endpoint: it has blocked the timeline feed while
+// serving stories normally. Pausing both would discard the working one, and
+// stories are gone in a day.
+func TestThrottledFeedDoesNotPauseTheOther(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	insta := &fakeInsta{
+		postsErr: fmt.Errorf("posts: %w", domain.ErrRateLimited),
+		stories:  []domain.Media{media("s1", domain.KindStory, owner)},
+	}
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
+
+	now := time.Now()
+	p.tick(context.Background(), now)
+
+	if !p.feed(owner.PK, domain.KindPost).pausedUntil.After(now) {
+		t.Error("the throttled posts feed was not paused")
+	}
+	if p.feed(owner.PK, domain.KindStory).pausedUntil.After(now) {
+		t.Error("the working stories feed was paused because posts was throttled")
+	}
+
+	// The story still went out despite the other feed failing.
+	if len(sender.sent) != 1 || sender.sent[0].ID != "s1" {
+		t.Fatalf("sent %v, want the story delivered", ids(sender.sent))
+	}
+
+	// Stories stay due; posts do not, until the pause expires.
+	due := p.due(context.Background(), owner, now.Add(2*time.Minute))
+	if len(due) != 1 || due[0] != domain.KindStory {
+		t.Errorf("due = %v, want stories only while posts is paused", due)
 	}
 }

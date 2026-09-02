@@ -64,24 +64,31 @@ type Poller struct {
 	plan    *schedule.Plan
 
 	// Everything below is touched only by the single goroutine running Run.
-	lastPosts    map[string]time.Time
-	lastStories  map[string]time.Time
-	backoff      time.Duration
-	backoffUntil time.Time
-	awake        bool
-	authAlerted  bool
+	feeds       map[string]*feedState
+	awake       bool
+	authAlerted bool
+}
+
+// feedState tracks one account's one feed.
+//
+// Throttling is per endpoint, not per host: Instagram has blocked the timeline
+// feed while serving stories perfectly well. Pausing everything on one feed's
+// 401 would throw away the working one, and stories expire in a day.
+type feedState struct {
+	last        time.Time
+	backoff     time.Duration
+	pausedUntil time.Time
 }
 
 // New builds a poller over an already resolved set of targets.
 func New(insta instagramClient, repo mediaRepo, sender sender, targets []domain.User, plan *schedule.Plan) *Poller {
 	return &Poller{
-		insta:       insta,
-		repo:        repo,
-		sender:      sender,
-		targets:     targets,
-		plan:        plan,
-		lastPosts:   map[string]time.Time{},
-		lastStories: map[string]time.Time{},
+		insta:   insta,
+		repo:    repo,
+		sender:  sender,
+		targets: targets,
+		plan:    plan,
+		feeds:   map[string]*feedState{},
 	}
 }
 
@@ -108,10 +115,6 @@ func (p *Poller) Run(ctx context.Context) error {
 
 // tick polls whatever is due at now.
 func (p *Poller) tick(ctx context.Context, now time.Time) {
-	if now.Before(p.backoffUntil) {
-		return
-	}
-
 	if !p.plan.Active(now) {
 		if p.awake {
 			p.awake = false
@@ -125,7 +128,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 	}
 
 	var blocked error
-	throttled := false
 	polled := 0
 
 	for _, target := range p.targets {
@@ -149,9 +151,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Msg("poll failed for target")
 
-			if errors.Is(err, domain.ErrRateLimited) {
-				throttled = true
-			}
 			if blocked == nil && isBlockedErr(err) {
 				blocked = err
 			}
@@ -160,16 +159,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 
 	if polled == 0 {
 		return
-	}
-
-	// Polling on schedule through a throttle is what keeps the throttle alive.
-	if throttled {
-		p.backoff = min(max(p.backoff*pollBackoffFactor, minBackoff), maxBackoff)
-		p.backoffUntil = now.Add(p.backoff)
-		log.Warn().Dur("paused_for", p.backoff).Msg("instagram is throttling, pausing polling")
-	} else if p.backoff != 0 {
-		p.backoff = 0
-		log.Info().Msg("throttling cleared, back on schedule")
 	}
 
 	p.reportStall(ctx, blocked)
@@ -198,14 +187,36 @@ func (p *Poller) due(ctx context.Context, target domain.User, now time.Time) []d
 	}
 
 	var due []domain.Kind
-	if isDue(p.lastPosts[target.PK], account.Posts, now) {
-		due = append(due, domain.KindPost)
-	}
-	if isDue(p.lastStories[target.PK], account.Stories, now) {
-		due = append(due, domain.KindStory)
+	for _, candidate := range []struct {
+		kind  domain.Kind
+		every time.Duration
+	}{
+		{domain.KindPost, account.Posts},
+		{domain.KindStory, account.Stories},
+	} {
+		state := p.feed(target.PK, candidate.kind)
+		if now.Before(state.pausedUntil) {
+			continue
+		}
+		if isDue(state.last, candidate.every, now) {
+			due = append(due, candidate.kind)
+		}
 	}
 
 	return due
+}
+
+// feed returns the state for one account's feed, creating it on first use.
+func (p *Poller) feed(pk string, kind domain.Kind) *feedState {
+	key := pk + "/" + string(kind)
+
+	state, ok := p.feeds[key]
+	if !ok {
+		state = &feedState{}
+		p.feeds[key] = state
+	}
+
+	return state
 }
 
 // isDue reports whether a feed with the given interval should run. A zero
@@ -276,6 +287,12 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domai
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Str("kind", string(kind)).Msg("failed to fetch feed")
 			failures = append(failures, err)
+
+			// Polling on schedule through a throttle is what keeps it alive, so
+			// pause this feed — and only this feed.
+			if errors.Is(err, domain.ErrRateLimited) {
+				p.pause(target, kind, now)
+			}
 			continue
 		}
 
@@ -351,12 +368,25 @@ func (p *Poller) fetch(ctx context.Context, target domain.User, kind domain.Kind
 }
 
 func (p *Poller) markFetched(pk string, kind domain.Kind, now time.Time) {
-	if kind == domain.KindStory {
-		p.lastStories[pk] = now
-		return
-	}
+	state := p.feed(pk, kind)
 
-	p.lastPosts[pk] = now
+	state.last = now
+	state.backoff = 0
+	state.pausedUntil = time.Time{}
+}
+
+// pause backs one feed off after Instagram throttled it.
+func (p *Poller) pause(target domain.User, kind domain.Kind, now time.Time) {
+	state := p.feed(target.PK, kind)
+
+	state.backoff = min(max(state.backoff*pollBackoffFactor, minBackoff), maxBackoff)
+	state.pausedUntil = now.Add(state.backoff)
+
+	log.Warn().
+		Str("target", target.Username).
+		Str("kind", string(kind)).
+		Dur("paused_for", state.backoff).
+		Msg("instagram is throttling this feed, pausing it")
 }
 
 func isAuthErr(err error) bool {
