@@ -302,13 +302,13 @@ func TestProbe(t *testing.T) {
 		got := p.Probe(context.Background())
 
 		if !got.OK() {
-			t.Fatalf("probe not ok: %v", got.Targets[0].Err)
+			t.Fatalf("probe not ok: posts=%v stories=%v", got.Targets[0].Posts.Err, got.Targets[0].Stories.Err)
 		}
-		if got.Targets[0].Posts != 1 || got.Targets[0].Stories != 1 {
-			t.Errorf("counts = %d posts / %d stories, want 1/1", got.Targets[0].Posts, got.Targets[0].Stories)
+		if got.Targets[0].Posts.Count != 1 || got.Targets[0].Stories.Count != 1 {
+			t.Errorf("counts = %d posts / %d stories, want 1/1", got.Targets[0].Posts.Count, got.Targets[0].Stories.Count)
 		}
-		if !got.Targets[0].Latest.Equal(newer.TakenAt) {
-			t.Errorf("latest = %v, want the story timestamp %v", got.Targets[0].Latest, newer.TakenAt)
+		if !got.Targets[0].Latest().Equal(newer.TakenAt) {
+			t.Errorf("latest = %v, want the story timestamp %v", got.Targets[0].Latest(), newer.TakenAt)
 		}
 	})
 
@@ -322,8 +322,12 @@ func TestProbe(t *testing.T) {
 		if got.OK() {
 			t.Fatal("probe reported ok despite a failing feed")
 		}
-		if !errors.Is(got.Targets[0].Err, domain.ErrRateLimited) {
-			t.Errorf("err = %v, want rate limited", got.Targets[0].Err)
+		if !errors.Is(got.Targets[0].Posts.Err, domain.ErrRateLimited) {
+			t.Errorf("posts err = %v, want rate limited", got.Targets[0].Posts.Err)
+		}
+		// The other feed answered, so this is not a total failure.
+		if got.Targets[0].Failed() {
+			t.Error("a target with one working feed reported total failure")
 		}
 	})
 

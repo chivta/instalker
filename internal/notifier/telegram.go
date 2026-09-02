@@ -192,8 +192,14 @@ func (t *Telegram) Run(ctx context.Context) error {
 func formatProbe(probe domain.Probe) string {
 	var b strings.Builder
 
-	header := "🏓 <b>Instagram scraping is working</b>"
-	if !probe.OK() {
+	// Three verdicts, not two: Instagram throttles per endpoint, so "posts are
+	// blocked but stories are fine" is a real and common state that neither
+	// "working" nor "failing" describes honestly.
+	header := "🟡 <b>Instagram scraping is partly working</b>"
+	switch {
+	case probe.OK():
+		header = "🏓 <b>Instagram scraping is working</b>"
+	case probe.Failed():
 		header = "🔴 <b>Instagram scraping is failing</b>"
 	}
 	fmt.Fprintf(&b, "%s\n<i>checked in %s</i>\n", header, probe.Elapsed.Round(time.Millisecond))
@@ -204,18 +210,37 @@ func formatProbe(probe domain.Probe) string {
 	}
 
 	for _, target := range probe.Targets {
-		if !target.OK() {
-			fmt.Fprintf(&b, "\n🔴 <b>%s</b> — %s", escape(target.User.Username), escape(describeErr(target.Err)))
-			continue
+		icon := "🟡"
+		switch {
+		case target.OK():
+			icon = "✅"
+		case target.Failed():
+			icon = "🔴"
 		}
 
-		fmt.Fprintf(&b, "\n✅ <b>%s</b> — %d posts, %d stories", escape(target.User.Username), target.Posts, target.Stories)
-		if !target.Latest.IsZero() {
-			fmt.Fprintf(&b, ", latest %s ago", time.Since(target.Latest).Round(time.Minute))
+		fmt.Fprintf(&b, "\n%s <b>%s</b> — %s, %s",
+			icon,
+			escape(target.User.Username),
+			describeFeed(target.Posts, "posts"),
+			describeFeed(target.Stories, "stories"),
+		)
+
+		if latest := target.Latest(); !latest.IsZero() {
+			fmt.Fprintf(&b, ", latest %s ago", time.Since(latest).Round(time.Minute))
 		}
 	}
 
 	return b.String()
+}
+
+// describeFeed renders one feed's outcome, so a working half is still visible
+// next to a throttled one.
+func describeFeed(feed domain.FeedProbe, name string) string {
+	if !feed.OK() {
+		return fmt.Sprintf("%s: %s", name, escape(describeErr(feed.Err)))
+	}
+
+	return fmt.Sprintf("%d %s", feed.Count, name)
 }
 
 // describeErr turns a scrape failure into something actionable, since the raw

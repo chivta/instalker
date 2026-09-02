@@ -40,15 +40,18 @@ tell whether scraping works right now instead of waiting for the next tick to
 show up in the logs:
 
 ```
-🏓 Instagram scraping is working
+🟡 Instagram scraping is partly working
 checked in 1.2s
 
 ✅ locroise — 12 posts, 2 stories, latest 2h0m0s ago
-✅ lem1rol — 11 posts, 0 stories, latest 18h0m0s ago
+🟡 lem1rol — posts: rate limited by Instagram, 0 stories
 ```
 
-When it fails, the reason is spelled out — throttling, a rejected session, or a
-pending challenge — because those need different responses. The probe delivers
+Each feed is reported separately, because Instagram throttles per endpoint: it
+will block the timeline while serving stories normally, and one verdict for the
+pair hides a working half. When something fails the reason is spelled out —
+throttling, a rejected session, or a pending challenge — because those need
+different responses. The probe delivers
 nothing and does not touch the seen-state, so running it never causes a missed
 or duplicated notification.
 
