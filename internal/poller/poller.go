@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -75,9 +77,15 @@ type Poller struct {
 // feed while serving stories perfectly well. Pausing everything on one feed's
 // 401 would throw away the working one, and stories expire in a day.
 type feedState struct {
+	username    string
+	kind        domain.Kind
 	last        time.Time
 	backoff     time.Duration
 	pausedUntil time.Time
+	// blocked holds why this feed is currently unusable, cleared only by a
+	// successful fetch. Deriving the chat alert from the last tick instead made
+	// it flap: a tick that polled only the healthy feed looked like recovery.
+	blocked error
 }
 
 // New builds a poller over an already resolved set of targets.
@@ -127,7 +135,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		log.Info().Msg("inside the polling window, polling resumed")
 	}
 
-	var blocked error
 	polled := 0
 
 	for _, target := range p.targets {
@@ -151,9 +158,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Msg("poll failed for target")
 
-			if blocked == nil && isBlockedErr(err) {
-				blocked = err
-			}
 		}
 	}
 
@@ -161,7 +165,7 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		return
 	}
 
-	p.reportStall(ctx, blocked)
+	p.reportStall(ctx)
 	metrics.IncPollCycle()
 }
 
@@ -212,7 +216,7 @@ func (p *Poller) feed(pk string, kind domain.Kind) *feedState {
 
 	state, ok := p.feeds[key]
 	if !ok {
-		state = &feedState{}
+		state = &feedState{kind: kind}
 		p.feeds[key] = state
 	}
 
@@ -237,28 +241,56 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(spread/2) + time.Duration(rand.Int64N(spread+1))
 }
 
-// reportStall tells the chat when Instagram stops answering, and again when it
+// reportStall tells the chat when a feed stops working, and again when it
 // recovers. Without this the bot polls into the void: the logs fill up but
 // nobody is watching them.
-func (p *Poller) reportStall(ctx context.Context, blocked error) {
-	switch {
-	case blocked != nil && !p.authAlerted:
-		p.authAlerted = true
+//
+// The verdict comes from the feeds' own state rather than the last tick's
+// outcome. A paused feed stays blocked until it actually succeeds, so a tick
+// that happened to poll only the healthy feed no longer reads as recovery —
+// which had the bot announcing failure and recovery in an endless alternation.
+func (p *Poller) reportStall(ctx context.Context) {
+	var (
+		names   []string
+		cause   error
+		blocked bool
+	)
 
-		text := "🔴 instalker: Instagram is refusing the session, so polling is stalled.\n\n" +
-			"Log in to instagram.com in a browser and send the fresh cookie here as " +
-			"<code>/session &lt;sessionid&gt;</code>."
-		if errors.Is(blocked, domain.ErrRateLimited) {
-			// Rotating the session would not help here, so do not ask for one.
-			text = "🔴 instalker: Instagram is rate limiting this host, so polling is stalled. " +
-				"It may clear on its own; if it persists the requests need to come from a different network."
+	for _, state := range p.feeds {
+		if state.blocked == nil {
+			continue
+		}
+		blocked = true
+
+		names = append(names, fmt.Sprintf("%s %s", state.username, state.kind))
+		// An auth failure needs a person, so it wins over a throttle when both
+		// are present: it is the one with something to do about it.
+		if cause == nil || (isAuthErr(state.blocked) && !isAuthErr(cause)) {
+			cause = state.blocked
+		}
+	}
+
+	switch {
+	case blocked && !p.authAlerted:
+		p.authAlerted = true
+		sort.Strings(names)
+
+		text := fmt.Sprintf("🔴 instalker: Instagram is refusing the session for %s.\n\n"+
+			"Log in to instagram.com in a browser and send the fresh cookie here as "+
+			"<code>/session &lt;sessionid&gt;</code>.", strings.Join(names, ", "))
+		if !isAuthErr(cause) {
+			// Rotating the session does not clear a throttle, and neither does
+			// moving networks — the same block appears from any address.
+			text = fmt.Sprintf("🔴 instalker: Instagram is rate limiting %s. "+
+				"Other feeds keep running, and this one retries on its own with a growing delay.",
+				strings.Join(names, ", "))
 		}
 
 		err := p.sender.Notify(ctx, text)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to send stall alert")
 		}
-	case blocked == nil && p.authAlerted:
+	case !blocked && p.authAlerted:
 		p.authAlerted = false
 		err := p.sender.Notify(ctx, "🟢 instalker: Instagram is answering again, polling resumed.")
 		if err != nil {
@@ -287,6 +319,12 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domai
 		if err != nil {
 			log.Error().Err(err).Str("target", target.Username).Str("kind", string(kind)).Msg("failed to fetch feed")
 			failures = append(failures, err)
+
+			state := p.feed(target.PK, kind)
+			state.username = target.Username
+			if isBlockedErr(err) {
+				state.blocked = err
+			}
 
 			// Polling on schedule through a throttle is what keeps it alive, so
 			// pause this feed — and only this feed.
@@ -373,6 +411,7 @@ func (p *Poller) markFetched(pk string, kind domain.Kind, now time.Time) {
 	state.last = now
 	state.backoff = 0
 	state.pausedUntil = time.Time{}
+	state.blocked = nil
 }
 
 // pause backs one feed off after Instagram throttled it.

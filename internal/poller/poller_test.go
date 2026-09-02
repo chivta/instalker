@@ -508,3 +508,72 @@ func TestThrottledFeedDoesNotPauseTheOther(t *testing.T) {
 		t.Errorf("due = %v, want stories only while posts is paused", due)
 	}
 }
+
+// The alert flapped in production: with posts paused and only stories due, a
+// tick polled just the healthy feed and that looked like recovery, so the bot
+// announced failure and recovery in an endless alternation.
+func TestStallAlertDoesNotFlapWhileOneFeedIsPaused(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	insta := &fakeInsta{postsErr: fmt.Errorf("posts: %w", domain.ErrRateLimited)}
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
+
+	ctx := context.Background()
+	start := time.Now()
+
+	// Posts fail and are paused; one alert.
+	p.tick(ctx, start)
+	if len(sender.notices) != 1 {
+		t.Fatalf("got %d notices, want 1: %v", len(sender.notices), sender.notices)
+	}
+
+	// Later ticks poll only stories, which work. That must not read as recovery
+	// however many times it happens.
+	for i := range 5 {
+		p.tick(ctx, start.Add(time.Duration(i+2)*time.Minute))
+	}
+	if len(sender.notices) != 1 {
+		t.Fatalf("alert flapped: %v", sender.notices)
+	}
+
+	// Recovery is announced only once posts actually succeed again.
+	insta.postsErr = nil
+	p.feed(owner.PK, domain.KindPost).pausedUntil = time.Time{}
+	p.tick(ctx, start.Add(time.Hour))
+
+	if len(sender.notices) != 2 {
+		t.Fatalf("got %d notices, want a recovery notice: %v", len(sender.notices), sender.notices)
+	}
+	if !strings.Contains(sender.notices[1], "answering again") {
+		t.Errorf("unexpected recovery notice: %q", sender.notices[1])
+	}
+}
+
+// The throttle appears from any network, so telling the user to move networks
+// sends them after a fix that does not exist.
+func TestThrottleAlertDoesNotBlameTheNetwork(t *testing.T) {
+	owner := domain.User{PK: "1", Username: "target"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	sender := &fakeSender{}
+	insta := &fakeInsta{
+		postsErr:   fmt.Errorf("posts: %w", domain.ErrRateLimited),
+		storiesErr: fmt.Errorf("stories: %w", domain.ErrRateLimited),
+	}
+	p := New(insta, repo, sender, []domain.User{owner}, schedule.Always(time.Minute, time.Minute))
+
+	p.tick(context.Background(), time.Now())
+
+	if len(sender.notices) != 1 {
+		t.Fatalf("got %d notices, want 1", len(sender.notices))
+	}
+	alert := sender.notices[0]
+	for _, unwanted := range []string{"different network", "this host", "/session"} {
+		if strings.Contains(alert, unwanted) {
+			t.Errorf("alert mentions %q, which is not the fix: %q", unwanted, alert)
+		}
+	}
+	if !strings.Contains(alert, "rate limiting") {
+		t.Errorf("alert does not name the throttle: %q", alert)
+	}
+}
