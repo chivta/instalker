@@ -31,7 +31,14 @@ type loginResponse struct {
 // surfaces as domain.ErrCheckpointRequired and can only be cleared by a human
 // completing the challenge in a browser.
 func (c *Client) Login(ctx context.Context, username, password string) error {
-	err := c.primeCSRF(ctx)
+	// A login runs when the old session is dead. Starting from an empty jar keeps
+	// its leftover cookies out of the request.
+	err := c.reset()
+	if err != nil {
+		return err
+	}
+
+	err = c.primeCSRF(ctx)
 	if err != nil {
 		return err
 	}
@@ -46,8 +53,8 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	if err != nil {
 		return fmt.Errorf("build login request: %w", err)
 	}
-	httpClient, csrf := c.snapshot()
-	decorate(req, csrf)
+	httpClient, csrf, claim := c.snapshot()
+	decorate(req, csrf, claim)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("referer", baseURL+"/accounts/login/")
 
@@ -115,7 +122,7 @@ func (c *Client) primeCSRF(ctx context.Context) error {
 	}
 	req.Header.Set("user-agent", userAgent)
 
-	httpClient, _ := c.snapshot()
+	httpClient, _, _ := c.snapshot()
 
 	res, err := httpClient.Do(req)
 	if err != nil {
@@ -124,7 +131,7 @@ func (c *Client) primeCSRF(ctx context.Context) error {
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, maxBodySize))
 
-	csrf := cookieFrom(httpClient, "csrftoken")
+	csrf := cookieFrom(httpClient, csrfCookie)
 	if csrf == "" {
 		return fmt.Errorf("%w: no csrftoken cookie issued", domain.ErrBadResponse)
 	}

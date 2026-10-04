@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/arvlas/instalker/internal/domain"
 )
@@ -13,31 +14,35 @@ import (
 const followingPageSize = 50
 
 // Profile resolves a username to the account behind it.
+//
+// It reads the id out of the profile page rather than calling
+// web_profile_info, which Instagram throttles hard. The same page carries the
+// GraphQL tokens, so the load is not wasted: it primes the posts query.
 func (c *Client) Profile(ctx context.Context, username string) (domain.User, error) {
-	var parsed struct {
-		Data struct {
-			User *struct {
-				ID        string `json:"id"`
-				Username  string `json:"username"`
-				FullName  string `json:"full_name"`
-				IsPrivate bool   `json:"is_private"`
-			} `json:"user"`
-		} `json:"data"`
-	}
-
-	err := c.get(ctx, "/api/v1/users/web_profile_info/?username="+url.QueryEscape(username), &parsed)
+	page, err := c.page(ctx, "/"+url.PathEscape(username)+"/")
 	if err != nil {
 		return domain.User{}, fmt.Errorf("profile %s: %w", username, err)
 	}
-	if parsed.Data.User == nil {
+
+	pk := between(page, `"profile_id":"`, `"`)
+	if pk == "" {
 		return domain.User{}, fmt.Errorf("profile %s: %w", username, domain.ErrNotFound)
 	}
 
+	tokens, err := parseTokens(page)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("profile %s: %w", username, err)
+	}
+
+	c.mu.Lock()
+	tokens.docID = c.tokens.docID
+	c.tokens = tokens
+	c.mu.Unlock()
+
 	return domain.User{
-		PK:        parsed.Data.User.ID,
-		Username:  parsed.Data.User.Username,
-		FullName:  parsed.Data.User.FullName,
-		IsPrivate: parsed.Data.User.IsPrivate,
+		PK:        pk,
+		Username:  username,
+		IsPrivate: strings.Contains(page, `"is_private":true`),
 	}, nil
 }
 

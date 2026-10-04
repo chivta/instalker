@@ -22,18 +22,18 @@ func TestStatusError(t *testing.T) {
 			want:   nil,
 		},
 		{
-			// Instagram's throttle response: a 401 that says "wait a few
-			// minutes". Reading it as a dead session provokes a password login
-			// and a challenge, so the message has to win over the status.
-			name:   "throttle disguised as 401",
+			// What Instagram tells an anonymous visitor. The "wait a few
+			// minutes" text reads like throttling and hid a dead session for a
+			// month; require_login is the part that matters.
+			name:   "logged out despite the wait message",
 			status: http.StatusUnauthorized,
-			body:   `{"message":"Please wait a few minutes before you try again.","require_login":true}`,
-			want:   domain.ErrRateLimited,
+			body:   `{"message":"Please wait a few minutes before you try again.","require_login":true,"igweb_rollout":true,"status":"fail"}`,
+			want:   domain.ErrUnauthorized,
 		},
 		{
-			name:   "throttle disguised as 200",
-			status: http.StatusOK,
-			body:   `{"message":"Please wait a few minutes before you try again.","require_login":true}`,
+			name:   "wait message without require_login",
+			status: http.StatusBadRequest,
+			body:   `{"message":"Please wait a few minutes before you try again.","status":"fail"}`,
 			want:   domain.ErrRateLimited,
 		},
 		{
@@ -133,5 +133,30 @@ func TestSessionUser(t *testing.T) {
 				t.Errorf("pk = %q, want %q", me.PK, tt.wantPK)
 			}
 		})
+	}
+}
+
+func TestParseTokens(t *testing.T) {
+	page := `<html><script id="__eqmc" type="application/json">{"e":"1","f":"DTSG-TOKEN","l":null}</script>` +
+		`["LSD",[],{"token":"LSD-TOKEN"}]` +
+		`<link href="https://static.cdninstagram.com/rsrc.php/v4/a.js" as="script">` +
+		`<link href="https://static.cdninstagram.com/rsrc.php/v4/a.js" as="script">` +
+		`<link href="https://static.cdninstagram.com/rsrc.php/v4/b.css" as="style">`
+
+	tokens, err := parseTokens(page)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if tokens.dtsg != "DTSG-TOKEN" || tokens.lsd != "LSD-TOKEN" {
+		t.Errorf("tokens = %+v", tokens)
+	}
+	if len(tokens.scripts) != 1 {
+		t.Errorf("scripts = %v, want the one unique .js bundle", tokens.scripts)
+	}
+
+	// A page served to a logged-out visitor carries no fb_dtsg.
+	_, err = parseTokens(`<html>["LSD",[],{"token":"x"}]</html>`)
+	if !errors.Is(err, domain.ErrUnauthorized) {
+		t.Errorf("logged-out page: got %v, want ErrUnauthorized", err)
 	}
 }
