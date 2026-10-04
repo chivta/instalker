@@ -404,6 +404,17 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domai
 		}
 	}
 
+	// One line per successful poll. Without it a healthy bot and a stuck one
+	// look the same in the logs, which hid a dead session for a month.
+	if len(failures) < len(due) {
+		log.Info().
+			Str("target", target.Username).
+			Strs("feeds", kindNames(due)).
+			Int("fetched", len(media)).
+			Int("new", fresh).
+			Msg("polled target")
+	}
+
 	// Baselining off a half-fetched target would mark only what was reachable as
 	// seen, and the missing feed would later arrive as a flood of "new" media.
 	if !initialized && len(failures) == 0 {
@@ -445,6 +456,15 @@ func (p *Poller) reloginOnce(ctx context.Context) bool {
 	p.relogin = reloginSucceeded
 
 	return true
+}
+
+func kindNames(kinds []domain.Kind) []string {
+	names := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		names = append(names, string(kind))
+	}
+
+	return names
 }
 
 func (p *Poller) fetch(ctx context.Context, target domain.User, kind domain.Kind) ([]domain.Media, error) {
