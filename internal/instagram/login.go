@@ -114,26 +114,25 @@ func (c *Client) SessionUser() (domain.User, error) {
 	return domain.User{PK: pk}, nil
 }
 
-// primeCSRF fetches the login page so the jar receives a csrftoken cookie.
+// primeCSRF loads the login page the way a browser does, which collects the
+// device cookies Instagram expects. Instagram does not always issue a csrftoken
+// there (it did not to the cluster), so when it is missing one is generated:
+// the login endpoint only checks that cookie and header match.
 func (c *Client) primeCSRF(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/accounts/login/", nil)
+	_, err := c.page(ctx, "/accounts/login/")
 	if err != nil {
-		return fmt.Errorf("build csrf request: %w", err)
+		return fmt.Errorf("load login page: %w", err)
 	}
-	req.Header.Set("user-agent", userAgent)
 
 	httpClient, _, _ := c.snapshot()
 
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("do csrf request: %w", err)
-	}
-	defer res.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, maxBodySize))
-
 	csrf := cookieFrom(httpClient, csrfCookie)
 	if csrf == "" {
-		return fmt.Errorf("%w: no csrftoken cookie issued", domain.ErrBadResponse)
+		csrf = newCSRFToken()
+		u, _ := url.Parse(baseURL)
+		httpClient.Jar.SetCookies(u, []*http.Cookie{
+			{Name: csrfCookie, Value: csrf, Domain: ".instagram.com", Path: "/"},
+		})
 	}
 
 	c.mu.Lock()
