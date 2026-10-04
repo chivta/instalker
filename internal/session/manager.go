@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -17,7 +19,13 @@ type store interface {
 
 type client interface {
 	SetSession(sessionID string) error
+	Login(ctx context.Context, username, password string) error
+	SessionID() string
 }
+
+// reloginCooldown spaces out password logins. Instagram answers a burst of
+// them with a checkpoint, which only a person can clear.
+const reloginCooldown = 2 * time.Hour
 
 // Manager owns the Instagram session cookie: where it is kept and how it is
 // replaced.
@@ -25,14 +33,46 @@ type client interface {
 // The stored cookie is the source of truth rather than the environment, because
 // it expires on its own schedule and has to be replaceable without a redeploy.
 type Manager struct {
-	store  store
-	client client
+	store    store
+	client   client
+	username string
+	password string
+
+	mu        sync.Mutex
+	lastLogin time.Time
 }
 
-// New builds a manager over a persistent store and the client to apply the
-// session to.
-func New(store store, client client) *Manager {
-	return &Manager{store: store, client: client}
+// New builds a manager over a persistent store, the client to apply the session
+// to, and the credentials it logs back in with when Instagram ends a session.
+func New(store store, client client, username, password string) *Manager {
+	return &Manager{store: store, client: client, username: username, password: password}
+}
+
+// Relogin replaces a session Instagram has logged out with a fresh password
+// login and stores it. Attempts are at most one per reloginCooldown; inside the
+// cooldown it fails without contacting Instagram.
+func (m *Manager) Relogin(ctx context.Context) error {
+	m.mu.Lock()
+	since := time.Since(m.lastLogin)
+	if !m.lastLogin.IsZero() && since < reloginCooldown {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: last login attempt was %s ago", domain.ErrRateLimited, since.Round(time.Minute))
+	}
+	m.lastLogin = time.Now()
+	m.mu.Unlock()
+
+	err := m.client.Login(ctx, m.username, m.password)
+	if err != nil {
+		return fmt.Errorf("password login: %w", err)
+	}
+
+	err = m.Store(ctx, m.client.SessionID())
+	if err != nil {
+		return err
+	}
+	log.Info().Msg("logged in again with the password, new session stored")
+
+	return nil
 }
 
 // Load applies the stored session, falling back to bootstrap the first time

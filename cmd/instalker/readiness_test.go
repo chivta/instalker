@@ -35,7 +35,7 @@ func TestReadinessOncePolling(t *testing.T) {
 	var ready readiness
 	ready.stalled(domain.ErrRateLimited)
 
-	watcher := poller.New(&stubInsta{}, nil, nil, nil, schedule.Always(time.Minute, time.Minute))
+	watcher := poller.New(&stubInsta{}, nil, nil, nil, nil, schedule.Always(time.Minute, time.Minute))
 	ready.polling(watcher)
 
 	probe, err := ready.probe(context.Background())

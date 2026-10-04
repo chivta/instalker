@@ -95,7 +95,7 @@ func run(cfg config.Config) error {
 		<-probeErr
 	}()
 
-	sessions := session.New(storage.NewStateRepo(db), insta)
+	sessions := session.New(storage.NewStateRepo(db), insta, cfg.Username, cfg.Password)
 
 	// Commands are served from here on, before Instagram is contacted. Startup
 	// can spend minutes retrying a throttled Instagram, and a bot that only
@@ -148,7 +148,7 @@ func run(cfg config.Config) error {
 	}
 
 	repo := storage.NewMediaRepo(db)
-	watcher := poller.New(insta, repo, telegram, targets, plan)
+	watcher := poller.New(insta, repo, telegram, sessions, targets, plan)
 	ready.polling(watcher)
 
 	err = telegram.Notify(ctx, fmt.Sprintf("🟢 instalker is up, watching <b>%s</b> during %s",
@@ -237,36 +237,37 @@ func tryStartup(
 		log.Error().Err(err).Msg("failed to read remembered targets")
 	}
 
-	// Resolving is a network call per account, and the answer rarely changes.
-	// With a usable cache there is no point spending the full retry budget on
-	// it: fail fast and fall back.
-	attempts := authRetryAttempts
+	// Every lookup is a request Instagram counts, and an account's id never
+	// changes. When the cache covers what is wanted, startup makes no Instagram
+	// calls; a dead session surfaces on the first poll, which logs back in.
 	if covers(cached, wanted) {
-		attempts = 1
+		targets := pick(cached, wanted)
+		log.Info().Int("targets", len(targets)).Msg("using remembered targets")
+
+		return me, targets, nil
 	}
 
-	// This is the first call that actually exercises the session, so it is the
-	// one that gets the retry budget.
 	var targets []domain.User
-	err = withBackoff(ctx, "resolve targets", attempts, func() error {
+	resolve := func() error {
 		var resolveErr error
 		targets, resolveErr = poller.ResolveTargets(ctx, insta, me, wanted)
 		// Each attempt updates what /ping reports, so a session pasted during
 		// the retry window is reflected on the next answer.
 		ready.stalled(resolveErr)
 		return resolveErr
-	})
-	if err != nil {
-		// A throttled lookup must not stop the bot from starting when it
-		// already knows these accounts. Anything else — a rejected session, a
-		// challenge — is still fatal, because the cache cannot fix it.
-		if !errors.Is(err, domain.ErrRateLimited) || !covers(cached, wanted) {
-			return domain.User{}, nil, err
+	}
+
+	err = withBackoff(ctx, "resolve targets", authRetryAttempts, resolve)
+	if errors.Is(err, domain.ErrUnauthorized) {
+		reloginErr := sessions.Relogin(ctx)
+		if reloginErr != nil {
+			log.Error().Err(reloginErr).Msg("logging back in failed")
+		} else {
+			err = withBackoff(ctx, "resolve targets", authRetryAttempts, resolve)
 		}
-
-		log.Warn().Err(err).Int("targets", len(cached)).Msg("using remembered targets, resolution is throttled")
-
-		return me, cached, nil
+	}
+	if err != nil {
+		return domain.User{}, nil, err
 	}
 
 	err = cache.Save(ctx, targets)
@@ -275,6 +276,26 @@ func tryStartup(
 	}
 
 	return me, targets, nil
+}
+
+// pick returns the remembered accounts that were asked for, or all of them
+// when the accounts come from the following list.
+func pick(cached []domain.User, wanted []string) []domain.User {
+	if len(wanted) == 0 {
+		return cached
+	}
+
+	var out []domain.User
+	for _, target := range cached {
+		for _, username := range wanted {
+			if strings.EqualFold(target.Username, username) {
+				out = append(out, target)
+				break
+			}
+		}
+	}
+
+	return out
 }
 
 // covers reports whether the cache holds every account that was asked for. An

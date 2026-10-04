@@ -41,7 +41,22 @@ func (f *fakeStore) SetSession(_ context.Context, sessionID string) error {
 }
 
 type fakeClient struct {
-	applied string
+	applied  string
+	logins   int
+	loginErr error
+}
+
+func (f *fakeClient) Login(context.Context, string, string) error {
+	f.logins++
+	if f.loginErr != nil {
+		return f.loginErr
+	}
+	f.applied = "30000000003:FreshFromLogin:1:Token"
+	return nil
+}
+
+func (f *fakeClient) SessionID() string {
+	return f.applied
 }
 
 func (f *fakeClient) SetSession(sessionID string) error {
@@ -56,7 +71,7 @@ func TestLoadPrefersStoredSession(t *testing.T) {
 	store := &fakeStore{stored: validSession}
 	client := &fakeClient{}
 
-	err := New(store, client).Load(context.Background(), otherSession)
+	err := New(store, client, "user", "pass").Load(context.Background(), otherSession)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -74,7 +89,7 @@ func TestLoadSeedsFromBootstrap(t *testing.T) {
 	store := &fakeStore{}
 	client := &fakeClient{}
 
-	err := New(store, client).Load(context.Background(), validSession)
+	err := New(store, client, "user", "pass").Load(context.Background(), validSession)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -88,7 +103,7 @@ func TestLoadSeedsFromBootstrap(t *testing.T) {
 }
 
 func TestLoadWithoutAnySession(t *testing.T) {
-	err := New(&fakeStore{}, &fakeClient{}).Load(context.Background(), "")
+	err := New(&fakeStore{}, &fakeClient{}, "user", "pass").Load(context.Background(), "")
 
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound so the caller can try a password login", err)
@@ -99,7 +114,7 @@ func TestUpdateRejectsInvalidWithoutStoring(t *testing.T) {
 	store := &fakeStore{stored: validSession}
 	client := &fakeClient{}
 
-	err := New(store, client).Update(context.Background(), invalidSession)
+	err := New(store, client, "user", "pass").Update(context.Background(), invalidSession)
 	if !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("got %v, want ErrUnauthorized", err)
 	}
@@ -114,7 +129,7 @@ func TestUpdateAppliesAndPersists(t *testing.T) {
 	store := &fakeStore{stored: validSession}
 	client := &fakeClient{}
 
-	err := New(store, client).Update(context.Background(), otherSession)
+	err := New(store, client, "user", "pass").Update(context.Background(), otherSession)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -124,5 +139,39 @@ func TestUpdateAppliesAndPersists(t *testing.T) {
 	}
 	if store.stored != otherSession {
 		t.Errorf("stored %q, want the new session", store.stored)
+	}
+}
+
+func TestReloginStoresTheNewSession(t *testing.T) {
+	store := &fakeStore{stored: validSession}
+	client := &fakeClient{}
+
+	err := New(store, client, "user", "pass").Relogin(context.Background())
+	if err != nil {
+		t.Fatalf("relogin: %v", err)
+	}
+
+	if store.stored != client.applied || client.logins != 1 {
+		t.Errorf("stored %q after %d logins, want the login's session after one", store.stored, client.logins)
+	}
+}
+
+// A burst of password logins is what earns a checkpoint, so a second attempt
+// inside the cooldown must not reach Instagram.
+func TestReloginCooldown(t *testing.T) {
+	client := &fakeClient{loginErr: domain.ErrCheckpointRequired}
+	manager := New(&fakeStore{}, client, "user", "pass")
+
+	err := manager.Relogin(context.Background())
+	if !errors.Is(err, domain.ErrCheckpointRequired) {
+		t.Fatalf("first attempt: got %v, want the login error", err)
+	}
+
+	err = manager.Relogin(context.Background())
+	if err == nil {
+		t.Fatal("second attempt inside the cooldown succeeded")
+	}
+	if client.logins != 1 {
+		t.Errorf("logged in %d times, want 1", client.logins)
 	}
 }

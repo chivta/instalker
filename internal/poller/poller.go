@@ -55,12 +55,17 @@ type sender interface {
 	Notify(ctx context.Context, text string) error
 }
 
+type reauthenticator interface {
+	Relogin(ctx context.Context) error
+}
+
 // Poller watches a set of Instagram accounts and forwards anything new, at the
 // cadence the schedule defines.
 type Poller struct {
 	insta  instagramClient
 	repo   mediaRepo
 	sender sender
+	auth   reauthenticator
 
 	targets []domain.User
 	plan    *schedule.Plan
@@ -69,7 +74,18 @@ type Poller struct {
 	feeds       map[string]*feedState
 	awake       bool
 	authAlerted bool
+	// relogin records this tick's re-login outcome, so several logged-out feeds
+	// in one tick trigger one login.
+	relogin reloginState
 }
+
+type reloginState int
+
+const (
+	reloginNotTried reloginState = iota
+	reloginSucceeded
+	reloginFailed
+)
 
 // feedState tracks one account's one feed.
 //
@@ -89,11 +105,14 @@ type feedState struct {
 }
 
 // New builds a poller over an already resolved set of targets.
-func New(insta instagramClient, repo mediaRepo, sender sender, targets []domain.User, plan *schedule.Plan) *Poller {
+// New builds a poller over an already resolved set of targets. auth may be nil,
+// in which case a logged-out session waits for someone to send /session.
+func New(insta instagramClient, repo mediaRepo, sender sender, auth reauthenticator, targets []domain.User, plan *schedule.Plan) *Poller {
 	return &Poller{
 		insta:   insta,
 		repo:    repo,
 		sender:  sender,
+		auth:    auth,
 		targets: targets,
 		plan:    plan,
 		feeds:   map[string]*feedState{},
@@ -136,6 +155,7 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 	}
 
 	polled := 0
+	p.relogin = reloginNotTried
 
 	for _, target := range p.targets {
 		if ctx.Err() != nil {
@@ -322,6 +342,14 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domai
 
 			state := p.feed(target.PK, kind)
 			state.username = target.Username
+
+			// A logged-out session is replaced with a password login. The
+			// failure then says nothing about the new session, so it neither
+			// blocks the feed nor alerts; the next tick retries the fetch.
+			if errors.Is(err, domain.ErrUnauthorized) && p.reloginOnce(ctx) {
+				continue
+			}
+
 			if isBlockedErr(err) {
 				state.blocked = err
 			}
@@ -395,6 +423,28 @@ func (p *Poller) pollTarget(ctx context.Context, target domain.User, due []domai
 	}
 
 	return nil
+}
+
+// reloginOnce logs back in after Instagram ends the session, at most once per
+// tick, and reports whether a fresh session is in place.
+func (p *Poller) reloginOnce(ctx context.Context) bool {
+	if p.auth == nil {
+		return false
+	}
+	if p.relogin != reloginNotTried {
+		return p.relogin == reloginSucceeded
+	}
+
+	err := p.auth.Relogin(ctx)
+	if err != nil {
+		p.relogin = reloginFailed
+		log.Error().Err(err).Msg("instagram ended the session and logging back in failed")
+		return false
+	}
+
+	p.relogin = reloginSucceeded
+
+	return true
 }
 
 func (p *Poller) fetch(ctx context.Context, target domain.User, kind domain.Kind) ([]domain.Media, error) {
