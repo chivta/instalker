@@ -135,11 +135,12 @@ $EDITOR k8s/secrets.yaml
 sops -e k8s/secrets.yaml > k8s/secrets.enc.yaml
 ```
 
-**`IG_SESSIONID` is not rotated this way.** It expires on its own schedule, far
-more often than anything else here, so the database on the PVC is its source of
-truth and `/session` is how it is replaced. The environment variable is only a
-bootstrap: it seeds the database the first time there is nothing stored, and is
-ignored from then on. Once seeded it can be emptied.
+The Instagram session lives in the database on the PVC, and `/session` replaces
+it day to day. `IG_SESSIONID` seeds that database on first start. When Instagram
+ends the stored session, the bot tries `IG_SESSIONID` once if it holds a
+different session, then a password login. So putting a fresh cookie in the
+secret and letting the pod restart recovers a bot whose host Instagram refuses
+password logins from, which happened in October 2026.
 
 Image pulls from GHCR authenticate through the k3s node's `registries.yaml`, so the namespace needs no pull secret.
 The SQLite file sits on a 1Gi `ReadWriteOnce` PVC mounted at `/app/data`. Because
@@ -173,8 +174,9 @@ Telegram forbids bots from opening a conversation. Open
 
 ### 2. Instagram logins
 
-The bot logs in with `USERNAME` and `PASSWORD` when it has no session, and again
-whenever Instagram ends the session it has, at most once every 2 hours so a
+The bot logs in with `USERNAME` and `PASSWORD` when it has no session. When
+Instagram ends the session it has, the bot first tries `IG_SESSIONID` if that is
+a different session, then a password login, at most once every 2 hours so a
 failing account is not pushed into a checkpoint.
 
 A checkpoint (Instagram asking for a code sent to the account's email or phone)
