@@ -38,10 +38,7 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 		return err
 	}
 
-	err = c.primeCSRF(ctx)
-	if err != nil {
-		return err
-	}
+	c.primeCSRF()
 
 	form := url.Values{}
 	form.Set("username", username)
@@ -69,15 +66,19 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 		return fmt.Errorf("read login body: %w", err)
 	}
 
+	if res.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: login answered 429", domain.ErrRateLimited)
+	}
+
 	var parsed loginResponse
 	err = json.Unmarshal(body, &parsed)
 	if err != nil {
-		return fmt.Errorf("%w: decode login: %v", domain.ErrBadResponse, err)
+		return fmt.Errorf("%w: decode login (status %d): %v", domain.ErrBadResponse, res.StatusCode, err)
 	}
 
 	switch {
 	case parsed.Authenticated:
-		session := cookieFrom(httpClient, "sessionid")
+		session := cookieFrom(httpClient, sessionCookie)
 		if session == "" {
 			return fmt.Errorf("%w: login succeeded without a session cookie", domain.ErrBadResponse)
 		}
@@ -87,8 +88,6 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 		return nil
 	case parsed.Message == "checkpoint_required" || parsed.CheckpointURL != "":
 		return fmt.Errorf("%w: complete the challenge at %s%s", domain.ErrCheckpointRequired, baseURL, parsed.CheckpointURL)
-	case res.StatusCode == http.StatusTooManyRequests:
-		return domain.ErrRateLimited
 	default:
 		return fmt.Errorf("%w: %s", domain.ErrUnauthorized, truncate(string(body), 300))
 	}
@@ -114,30 +113,20 @@ func (c *Client) SessionUser() (domain.User, error) {
 	return domain.User{PK: pk}, nil
 }
 
-// primeCSRF loads the login page the way a browser does, which collects the
-// device cookies Instagram expects. Instagram does not always issue a csrftoken
-// there (it did not to the cluster), so when it is missing one is generated:
-// the login endpoint only checks that cookie and header match.
-func (c *Client) primeCSRF(ctx context.Context) error {
-	_, err := c.page(ctx, "/accounts/login/")
-	if err != nil {
-		return fmt.Errorf("load login page: %w", err)
-	}
+// primeCSRF installs a generated CSRF token for the login request. The login
+// endpoint only checks that cookie and header match. Loading /accounts/login/
+// to get a token from Instagram is not needed, and Instagram answers that page
+// with 429 to an address it has seen many logged-out requests from.
+func (c *Client) primeCSRF() {
+	csrf := newCSRFToken()
 
 	httpClient, _, _ := c.snapshot()
-
-	csrf := cookieFrom(httpClient, csrfCookie)
-	if csrf == "" {
-		csrf = newCSRFToken()
-		u, _ := url.Parse(baseURL)
-		httpClient.Jar.SetCookies(u, []*http.Cookie{
-			{Name: csrfCookie, Value: csrf, Domain: ".instagram.com", Path: "/"},
-		})
-	}
+	u, _ := url.Parse(baseURL)
+	httpClient.Jar.SetCookies(u, []*http.Cookie{
+		{Name: csrfCookie, Value: csrf, Domain: ".instagram.com", Path: "/"},
+	})
 
 	c.mu.Lock()
 	c.csrfToken = csrf
 	c.mu.Unlock()
-
-	return nil
 }
