@@ -143,14 +143,7 @@ truth and `/session` is how it is replaced. The environment variable is only a
 bootstrap: it seeds the database the first time there is nothing stored, and is
 ignored from then on. Once seeded it can be emptied.
 
-The registry pull secret is the one thing SOPS does not cover, since it is a
-cluster-level docker config rather than app config:
-
-```sh
-cp .env.secrets.example .env.secrets   # GHCR credentials only
-./create-secrets.sh                    # creates the namespace and ghcr-secret
-```
-
+Image pulls from GHCR authenticate through the k3s node's `registries.yaml`, so the namespace needs no pull secret.
 The SQLite file sits on a 1Gi `ReadWriteOnce` PVC mounted at `/app/data`. Because
 that volume cannot be attached twice, the Deployment uses the `Recreate` strategy
 and stays at one replica — a rolling update would deadlock on the mount. The

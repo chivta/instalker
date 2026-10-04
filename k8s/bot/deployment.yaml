@@ -73,8 +73,6 @@ spec:
             claimName: instalker-data
         - name: tmp
           emptyDir: {}
-      imagePullSecrets:
-        - name: ghcr-secret
 
 ---
 apiVersion: v1
