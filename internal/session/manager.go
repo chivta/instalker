@@ -40,6 +40,11 @@ type Manager struct {
 
 	mu        sync.Mutex
 	lastLogin time.Time
+	// bootstrap is IG_SESSIONID. Relogin tries it once when it differs from the
+	// session Instagram ended, so a cookie put in the secret replaces a dead
+	// stored one even when password logins are refused.
+	bootstrap      string
+	bootstrapTried bool
 }
 
 // New builds a manager over a persistent store, the client to apply the session
@@ -48,11 +53,25 @@ func New(store store, client client, username, password string) *Manager {
 	return &Manager{store: store, client: client, username: username, password: password}
 }
 
-// Relogin replaces a session Instagram has logged out with a fresh password
-// login and stores it. Attempts are at most one per reloginCooldown; inside the
-// cooldown it fails without contacting Instagram.
+// Relogin replaces a session Instagram has logged out and stores the new one.
+// It first tries IG_SESSIONID if that is a different session not tried yet,
+// then a password login. Password logins are at most one per reloginCooldown;
+// inside the cooldown it fails without contacting Instagram.
 func (m *Manager) Relogin(ctx context.Context) error {
 	m.mu.Lock()
+	if m.bootstrap != "" && !m.bootstrapTried && m.bootstrap != m.client.SessionID() {
+		m.bootstrapTried = true
+		m.mu.Unlock()
+
+		err := m.Update(ctx, m.bootstrap)
+		if err != nil {
+			return fmt.Errorf("apply IG_SESSIONID: %w", err)
+		}
+		log.Info().Msg("replaced the ended session with IG_SESSIONID")
+
+		return nil
+	}
+
 	since := time.Since(m.lastLogin)
 	if !m.lastLogin.IsZero() && since < reloginCooldown {
 		m.mu.Unlock()
@@ -79,6 +98,10 @@ func (m *Manager) Relogin(ctx context.Context) error {
 // there is nothing stored yet. It reports domain.ErrNotFound when neither is
 // available, leaving the caller to decide what to do about it.
 func (m *Manager) Load(ctx context.Context, bootstrap string) error {
+	m.mu.Lock()
+	m.bootstrap = bootstrap
+	m.mu.Unlock()
+
 	stored, err := m.store.Session(ctx)
 	switch {
 	case err == nil && stored != "":

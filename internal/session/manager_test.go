@@ -175,3 +175,53 @@ func TestReloginCooldown(t *testing.T) {
 		t.Errorf("logged in %d times, want 1", client.logins)
 	}
 }
+
+// A cookie put in IG_SESSIONID replaces a dead stored session without a
+// password login, which matters when Instagram refuses logins from the host.
+func TestReloginPrefersADifferentBootstrap(t *testing.T) {
+	store := &fakeStore{stored: validSession}
+	client := &fakeClient{}
+	manager := New(store, client, "user", "pass")
+
+	err := manager.Load(context.Background(), otherSession)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	err = manager.Relogin(context.Background())
+	if err != nil {
+		t.Fatalf("relogin: %v", err)
+	}
+	if client.applied != otherSession || store.stored != otherSession || client.logins != 0 {
+		t.Fatalf("applied %q, stored %q after %d logins, want IG_SESSIONID without a login", client.applied, store.stored, client.logins)
+	}
+
+	// Tried once: the next failure goes to the password.
+	err = manager.Relogin(context.Background())
+	if err != nil {
+		t.Fatalf("second relogin: %v", err)
+	}
+	if client.logins != 1 {
+		t.Errorf("logins = %d, want the password tried after the bootstrap", client.logins)
+	}
+}
+
+// When IG_SESSIONID is the session that just died, it is not worth retrying.
+func TestReloginSkipsTheSameBootstrap(t *testing.T) {
+	store := &fakeStore{stored: validSession}
+	client := &fakeClient{}
+	manager := New(store, client, "user", "pass")
+
+	err := manager.Load(context.Background(), validSession)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	err = manager.Relogin(context.Background())
+	if err != nil {
+		t.Fatalf("relogin: %v", err)
+	}
+	if client.logins != 1 {
+		t.Errorf("logins = %d, want a password login", client.logins)
+	}
+}
