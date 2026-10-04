@@ -25,9 +25,9 @@ Who is watched, and how often, comes from `internal/schedule/schedule.toml`.
 When it lists no accounts, `TARGETS` is used, and failing that the accounts the
 logged-in user **follows**.
 
-Resolved accounts are remembered in the database. Looking a username up costs a
-request, and a throttled lookup used to stop the bot from starting at all — so
-when Instagram is rate limiting, it starts from what it already knows instead.
+Resolved accounts are remembered in the database, and startup uses them without
+asking Instagram again. An account the database does not know yet is resolved
+from its profile page.
 
 The first cycle for a target only records a baseline — existing posts and live
 stories are marked as seen without being sent, so starting the bot does not dump
@@ -47,11 +47,9 @@ checked in 1.2s
 🟡 lem1rol — posts: rate limited by Instagram, 0 stories
 ```
 
-Each feed is reported separately, because Instagram throttles per endpoint: it
-will block the timeline while serving stories normally, and one verdict for the
-pair hides a working half. When something fails the reason is spelled out —
-throttling, a rejected session, or a pending challenge — because those need
-different responses. The probe delivers
+Each feed is reported separately, so one failing feed does not hide a working
+one. A failure names its reason (throttling, a logged-out session, a pending
+challenge), because each needs a different response. The probe delivers
 nothing and does not touch the seen-state, so running it never causes a missed
 or duplicated notification.
 
@@ -173,40 +171,36 @@ Telegram forbids bots from opening a conversation. Open
 `CHAT_ID` and press **Start**. Until then every send fails with
 `chat not found`.
 
-### 2. Instagram requires a login challenge
+### 2. Instagram logins
 
-Instagram answers password logins for this account with `checkpoint_required`.
-The challenge code goes to the account's email or phone, so it cannot be cleared
-from the service.
+The bot logs in with `USERNAME` and `PASSWORD` when it has no session, and again
+whenever Instagram ends the session it has, at most once every 2 hours so a
+failing account is not pushed into a checkpoint.
 
-Clear it once in a browser, then hand the session to the bot:
-
-1. Log in to <https://www.instagram.com> as the account in `USERNAME` and
-   complete whatever verification is asked for.
-2. Open DevTools → **Application** → **Cookies** → `https://www.instagram.com`.
-3. Copy the value of the **`sessionid`** cookie.
-4. Put it in `.env` as `IG_SESSIONID=...` and restart.
-
-`IG_SESSIONID` takes priority over password login, and the bot falls back to a
-password login only when it is empty or rejected. Sessions last weeks; when one
-expires the bot reports it in the chat and the four steps above are repeated.
+A checkpoint (Instagram asking for a code sent to the account's email or phone)
+needs a person. Log in at <https://www.instagram.com> as `USERNAME`, complete the
+verification, copy the `sessionid` cookie from DevTools, and send it to the bot
+as `/session <value>`.
 
 ## Notes
 
 - SQLite (pure-Go `modernc.org/sqlite`) is used instead of Postgres: the state is
   a single dedupe table, and a one-binary deploy with no database server is worth
   more here than the shared convention.
-- Stories expire after 24 hours — keep `POLL_INTERVAL` well below that.
-- Throttling is **per endpoint**, not per host. Instagram has blocked the
-  timeline feed and profile lookups while serving stories normally, so each feed
-  backs off on its own — pausing everything would discard a working one, and
-  stories are gone within a day.
-- Instagram reports throttling as a **401 with `"Please wait a few minutes"`**,
-  not only as a 429. The client classifies on that message rather than the status
-  code, because reading it as a dead session leads to a password login and a
-  challenge that cannot be cleared automatically.
-- Throttling is applied per source address. A session that works from a home
-  connection can be refused from a datacenter, which is what makes the egress
-  network the thing to change when polling stalls for good.
+- Stories expire after 24 hours, so keep story intervals in `schedule.toml` well
+  below that.
+- Posts come from the GraphQL query Instagram's own profile page runs,
+  `PolarisProfilePostsTabContentQuery_connection`. In September 2026 Instagram
+  stopped serving `/api/v1/feed/user/` to web sessions and redirects it to the
+  homepage. The query's `doc_id` rotates; when it stops working the bot reads the
+  current one out of the page's scripts. gallery-dl's Instagram extractor
+  (codeberg.org/mikf/gallery-dl) follows these changes closely and is the place
+  to look when this breaks again.
+- Instagram answers a logged-out session the way it answers an anonymous
+  visitor: a 401 with `"require_login":true` and a "Please wait a few minutes"
+  message. That message is not throttling, and the client treats it as a dead
+  session. Throttling of a live session arrives as a 429.
+- Each feed backs off on its own when throttled, so a throttled feed does not
+  pause a working one.
 - Polling too aggressively is what gets Instagram accounts flagged. 5 minutes is
   a reasonable floor.
