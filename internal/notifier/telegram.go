@@ -93,6 +93,7 @@ func (t *Telegram) Send(ctx context.Context, media domain.Media) error {
 
 	// Instagram CDN links occasionally fail Telegram's server-side fetch; a
 	// text message with the links is better than losing the notification.
+	log.Warn().Err(err).Str("media_id", media.ID).Msg("album failed, sending links instead")
 	_, fallbackErr := t.bot.Send(t.chat, caption+"\n\n"+linkList(media), tele.ModeHTML, tele.NoPreview)
 	if fallbackErr != nil {
 		return fmt.Errorf("send album: %w (fallback: %v)", err, fallbackErr)
