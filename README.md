@@ -126,8 +126,8 @@ in the `homelab` repo under `clusters/main/apps/instalker/`.
 
 The bot's credentials live in `k8s/secrets.yaml`, which is **gitignored**, and are
 committed only in SOPS-encrypted form as `k8s/secrets.enc.yaml`. Encryption uses
-the same age recipient as `ruscan`, so Flux decrypts it in-cluster with the
-existing `ruscan-sops-age` secret referenced by the Kustomization.
+the shared app age recipient, so Flux decrypts it in-cluster with the
+existing `apps-sops-age` secret referenced by the Kustomization.
 
 To change a credential:
 
