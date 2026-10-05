@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -411,10 +413,7 @@ func TestJitterStaysNearTheBaseDelay(t *testing.T) {
 // The schedule's whole point is that feeds run at different cadences, so a due
 // check that ignores either the interval or the window would go unnoticed.
 func TestDueRespectsIntervalsAndWindow(t *testing.T) {
-	plan, err := schedule.Load()
-	if err != nil {
-		t.Fatalf("load schedule: %v", err)
-	}
+	plan := fixturePlan(t)
 
 	locroise := domain.User{PK: "1", Username: "locroise"}
 	lem1rol := domain.User{PK: "2", Username: "lem1rol"}
@@ -452,10 +451,7 @@ func TestDueRespectsIntervalsAndWindow(t *testing.T) {
 
 // Outside the window nothing is fetched at all, however overdue it looks.
 func TestTickSkipsOutsideTheWindow(t *testing.T) {
-	plan, err := schedule.Load()
-	if err != nil {
-		t.Fatalf("load schedule: %v", err)
-	}
+	plan := fixturePlan(t)
 
 	owner := domain.User{PK: "1", Username: "locroise"}
 	insta := &fakeInsta{posts: []domain.Media{media("p1", domain.KindPost, owner)}}
@@ -471,6 +467,56 @@ func TestTickSkipsOutsideTheWindow(t *testing.T) {
 	}
 	if len(p.feeds) != 0 {
 		t.Error("a feed was fetched outside the window")
+	}
+}
+
+// The production schedule is meant to poll once a day at 22:00. That holds only
+// while its interval is longer than its window and shorter than a day, so it is
+// checked here against the embedded file.
+func TestProductionSchedulePollsOnceADay(t *testing.T) {
+	plan, err := schedule.Load()
+	if err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+
+	const (
+		days     = 3
+		pollHour = 22
+	)
+
+	target := domain.User{PK: "1", Username: "locroise"}
+	repo := &fakeRepo{seen: map[string]bool{}, initialized: true}
+	p := New(&fakeInsta{}, repo, &fakeSender{}, nil, []domain.User{target}, plan)
+
+	ctx := context.Background()
+	start := time.Date(2026, 10, 5, 0, 0, 30, 0, plan.Location)
+
+	var polls []time.Time
+	for now := start; now.Before(start.AddDate(0, 0, days)); now = now.Add(tickInterval) {
+		if !plan.Active(now) {
+			continue
+		}
+
+		due := p.due(ctx, target, now)
+		if len(due) == 0 {
+			continue
+		}
+		if len(due) != 2 {
+			t.Errorf("due at %s = %v, want both feeds together", now.Format(time.DateTime), due)
+		}
+		for _, kind := range due {
+			p.markFetched(target.PK, kind, now)
+		}
+		polls = append(polls, now)
+	}
+
+	if len(polls) != days {
+		t.Fatalf("polled %d times in %d days, want one a day: %v", len(polls), days, polls)
+	}
+	for _, at := range polls {
+		if at.Hour() != pollHour || at.Minute() != 0 {
+			t.Errorf("polled at %s, want %d:00", at.Format(time.DateTime), pollHour)
+		}
 	}
 }
 
@@ -625,4 +671,41 @@ func TestFailedReloginAlerts(t *testing.T) {
 	if len(sender.notices) != 1 || !strings.Contains(sender.notices[0], "/session") {
 		t.Fatalf("notices = %v, want one asking for /session", sender.notices)
 	}
+}
+
+// fixturePlan loads a fixed schedule, so these tests do not change meaning
+// whenever the production schedule does.
+func fixturePlan(t *testing.T) *schedule.Plan {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "schedule.toml")
+	err := os.WriteFile(path, []byte(`
+timezone = "Europe/Kyiv"
+
+[window]
+from = "10:00"
+to = "01:00"
+
+[defaults]
+posts = "1h"
+stories = "1h"
+
+[[accounts]]
+username = "locroise"
+stories = "30m"
+
+[[accounts]]
+username = "lem1rol"
+`), 0o600)
+	if err != nil {
+		t.Fatalf("write fixture schedule: %v", err)
+	}
+	t.Setenv(schedule.PathEnv, path)
+
+	plan, err := schedule.Load()
+	if err != nil {
+		t.Fatalf("load fixture schedule: %v", err)
+	}
+
+	return plan
 }

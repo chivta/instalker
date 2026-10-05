@@ -1,28 +1,29 @@
 # When each account is checked, and how often.
 #
 # This file is compiled into the binary, so changing the schedule means editing
-# it here and rebuilding — no secret to re-encrypt and no manifest to touch.
-# Set SCHEDULE_PATH to point at a different file at runtime instead.
+# it here and rebuilding. There is no secret to re-encrypt and no manifest to
+# touch. Set SCHEDULE_PATH to point at a different file at runtime instead.
 
 # Every time below is read in this zone.
 timezone = "Europe/Kyiv"
 
-# Nothing is polled outside these hours. The window may cross midnight, and
-# "01:00" means the small hours of the following morning.
+# Nothing is polled outside these hours. The window may cross midnight.
 [window]
-from = "10:00"
-to = "01:00"
+from = "22:00"
+to = "23:00"
 
 # Used for any account that does not override them. "0" disables a feed.
+#
+# An interval longer than the window gives one poll a day, when the window
+# opens. The rest of the hour is there for retries.
 [defaults]
-posts = "1h"
-stories = "1h"
+posts = "20h"
+stories = "20h"
 
 # Accounts to watch. Leaving this empty falls back to TARGETS, and then to
 # whoever the logged-in account follows.
 [[accounts]]
 username = "locroise"
-stories = "30m"
 
 [[accounts]]
 username = "lem1rol"

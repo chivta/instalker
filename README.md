@@ -90,20 +90,25 @@ compiled into the binary:
 timezone = "Europe/Kyiv"
 
 [window]
-from = "10:00"
-to = "01:00"
+from = "22:00"
+to = "23:00"
 
 [defaults]
-posts = "1h"
-stories = "1h"
+posts = "20h"
+stories = "20h"
 
 [[accounts]]
 username = "locroise"
-stories = "30m"
 ```
 
 Nothing is polled outside the window, which may cross midnight. Each account
 takes the defaults unless it overrides them, and `"0"` switches a feed off.
+
+An interval longer than the window gives one poll a day, on the first tick after
+the window opens. The schedule above polls both feeds once at 22:00 Kyiv time,
+and the rest of the hour is there for retries after a throttled attempt. An
+account can still poll more often with its own interval, for example
+`stories = "30m"` under a wider window.
 The accounts listed here are also *who* gets watched; `TARGETS` and the
 following list are only fallbacks when the file names none.
 
@@ -189,8 +194,10 @@ as `/session <value>`.
 - SQLite (pure-Go `modernc.org/sqlite`) is used instead of Postgres: the state is
   a single dedupe table, and a one-binary deploy with no database server is worth
   more here than the shared convention.
-- Stories expire after 24 hours, so keep story intervals in `schedule.toml` well
-  below that.
+- Stories expire after 24 hours. With one poll a day, a story posted right after
+  a poll is still live at the next one only if that poll runs on time, so a late
+  or failed poll can miss it. A shorter story interval closes that gap with more
+  requests.
 - Posts come from the GraphQL query Instagram's own profile page runs,
   `PolarisProfilePostsTabContentQuery_connection`. In September 2026 Instagram
   stopped serving `/api/v1/feed/user/` to web sessions and redirects it to the
@@ -204,5 +211,6 @@ as `/session <value>`.
   session. Throttling of a live session arrives as a 429.
 - Each feed backs off on its own when throttled, so a throttled feed does not
   pause a working one.
-- Polling too aggressively is what gets Instagram accounts flagged. 5 minutes is
-  a reasonable floor.
+- Polling too aggressively is what gets Instagram accounts flagged. Instagram
+  showed the "We suspect automated behavior" notice in October 2026 at one poll
+  an hour, which is why the schedule is down to one a day.
