@@ -27,7 +27,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: instalker
-          image: ghcr.io/chivta/instalker:47efc37654b11876082bda744f5773aec5e07cd1
+          image: ghcr.io/chivta/instalker:ddd629e00cc34b30f33f38f102adea25b4c27e59
           ports:
             - name: http
               containerPort: 8080
